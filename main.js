@@ -2,14 +2,20 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-// NOTE: not requiring DRACO for this app. We'll try body.draco.glb first, then fall back to body.glb.
-// If you later add DRACO decoder files, we can enable DRACOLoader.
 
 import { EXERCISES, getExerciseById } from "./lib/exercises.js";
 import { classifyMeshName } from "./lib/muscleMap.js";
-import { loadState, saveState, resetState } from "./lib/storage.js";
 import { tickDecay, applyStimulus, computeHeat, ensureMuscle } from "./lib/recovery.js";
 import { generateRecs } from "./lib/recs.js";
+
+/* ==============================
+   PHP API endpoints
+============================== */
+const API_STATE_GET    = "./api/get_muscle_state.php";
+const API_LOGS_GET     = "./api/get_logs.php";
+const API_WORKOUT_LOG  = "./api/log_workout.php";
+const API_STATE_RESET  = "./api/state_reset.php";
+
 
 /* ----------------------------- DOM refs ----------------------------- */
 const mount = document.getElementById("view");
@@ -29,10 +35,78 @@ const resetBtn = document.getElementById("resetBtn");
 const logsBox = document.getElementById("logsBox");
 
 /* ----------------------------- State ----------------------------- */
-let state = loadState();
-// decay immediately so it looks right on load
-tickDecay(state, Date.now());
-saveState(state);
+let state = {
+  logs: [],
+  muscle: {},     // { groupId: { load, lastTrained, lastPing } }
+  lastUpdate: Date.now(),
+};
+
+/* ----------------------------- API helpers ----------------------------- */
+async function apiJson(url, opts = {}) {
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...opts,
+    headers: {
+      ...(opts.headers || {}),
+      "Content-Type": "application/json",
+    },
+  });
+
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`API ${url} returned non-JSON:\n${text.slice(0, 500)}`);
+  }
+
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || `HTTP ${res.status} from ${url}`);
+  }
+  return data;
+}
+
+async function loadMuscleStateServer() {
+  const data = await apiJson(API_STATE_GET, { method: "GET" });
+  // expected: { ok:true, rows:[...] }
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  const muscle = {};
+
+  for (const r of rows) {
+    const gid = String(r.muscle_group || "").trim();
+    if (!gid) continue;
+
+    muscle[gid] = {
+      load: Number(r.load_value || 0),
+      lastTrained: Number(r.last_trained_at || 0) * 1000, // php returns unix seconds
+      lastPing: Number(r.last_ping_at || 0) * 1000,
+    };
+  }
+
+  state.muscle = muscle;
+  state.lastUpdate = Date.now();
+}
+
+async function loadLogsServer() {
+  const data = await apiJson(API_LOGS_GET, { method: "GET" });
+  // expected: { ok:true, rows:[...] }
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+
+  // normalize to match your renderLogs()
+  state.logs = rows.map((r) => ({
+    id: String(r.id),
+    date: String(r.workout_date),
+    exerciseId: String(r.exercise_id),
+    exerciseName: String(r.exercise_name),
+    sets: Number(r.sets),
+    reps: Number(r.reps),
+    loadLbs: r.load_lbs === null || r.load_lbs === undefined ? null : Number(r.load_lbs),
+    stimulus: Number(r.stimulus),
+  }));
+
+  state.lastUpdate = Date.now();
+}
 
 /* ----------------------------- Three.js setup ----------------------------- */
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
@@ -71,22 +145,10 @@ scene.add(grid);
 
 /* ----------------------------- Model bookkeeping ----------------------------- */
 let currentModel = null;
-
-// “human stand-in” skin shell meshes (always visible)
 const skinShellMeshes = [];
-
-// gym-relevant meshes (clickable + heat-colored)
-const gymMeshes = []; // { mesh, groups: string[] }
-
-// quick array of pickables (meshes only)
+const gymMeshes = [];
 const pickables = [];
-
-// selection
 let selectedMesh = null;
-
-// neglected alert pulse
-let pulse = null; // { until:number, groupId:string }
-let lastGlobalBeepAt = 0;
 
 /* ----------------------------- Materials ----------------------------- */
 function makeBaselineMuscleMaterial() {
@@ -100,8 +162,6 @@ function makeBaselineMuscleMaterial() {
 }
 
 function makeSkinMaterial() {
-  // subtle “human stand-in” shell (keeps it from being creepy)
-  // IMPORTANT: not trying to be realistic skin; just a soft translucent cover.
   return new THREE.MeshStandardMaterial({
     color: 0x8e8e94,
     roughness: 0.95,
@@ -114,7 +174,6 @@ function makeSkinMaterial() {
   });
 }
 
-// selection styling (applied on top of heat without swapping materials)
 function applySelectionLook(mesh) {
   if (!mesh?.material) return;
   mesh.material.emissive = new THREE.Color(0x18a944);
@@ -123,69 +182,39 @@ function applySelectionLook(mesh) {
   mesh.material.wireframe = true;
   mesh.material.needsUpdate = true;
 }
+
 function clearSelectionLook(mesh) {
   if (!mesh?.material) return;
   mesh.material.wireframe = false;
   mesh.material.needsUpdate = true;
 }
 
-/* ----------------------------- Heat -> color mapping ----------------------------- */
+/* ----------------------------- Heat ----------------------------- */
 function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
 
-// not using pure red unless overdoing / warnings
 function heatToVisual(heat, overdo) {
   const h = clamp01(heat);
 
-  // base
   let color = new THREE.Color(0x7a7a7a);
   let emissive = new THREE.Color(0x000000);
   let eI = 0.0;
 
   if (overdo) {
-    // reserved red: ignoring recovery signals / overdoing
     color = new THREE.Color(0xff3c3c);
     emissive = new THREE.Color(0xff3c3c);
     eI = 1.25;
     return { color, emissive, emissiveIntensity: eI };
   }
 
-  if (h < 0.12) {
-    // baseline gray
-    return { color, emissive, emissiveIntensity: eI };
-  }
+  if (h < 0.12) return { color, emissive, emissiveIntensity: eI };
 
-  // green -> yellow -> orange
-  if (h < 0.35) {
-    color = new THREE.Color(0x7a7a7a);
-    emissive = new THREE.Color(0x3cff7a);
-    eI = 0.65;
-  } else if (h < 0.60) {
-    emissive = new THREE.Color(0xffd84d);
-    eI = 0.72;
-  } else if (h < 0.85) {
-    emissive = new THREE.Color(0xff9b3c);
-    eI = 0.80;
-  } else {
-    // very high load but not “red” unless overdo is true
-    emissive = new THREE.Color(0xff9b3c);
-    eI = 0.95;
-  }
+  if (h < 0.35) emissive = new THREE.Color(0x3cff7a);
+  else if (h < 0.6) emissive = new THREE.Color(0xffd84d);
+  else emissive = new THREE.Color(0xff9b3c);
 
-  return { color, emissive, emissiveIntensity: eI };
-}
-
-/* ----------------------------- Console helpers ----------------------------- */
-function sep(label = "") {
-  const line = "────────────────────────────────────────";
-  console.log(label ? `${line}\n${label}\n${line}` : line);
-}
-
-function prettyGroupId(id) {
-  return (id || "")
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return { color, emissive, emissiveIntensity: 0.8 };
 }
 
 /* ----------------------------- Loading model ----------------------------- */
@@ -215,10 +244,10 @@ function clearModel() {
 }
 
 async function loadGLBWithFallback() {
-  // Try draco first (if you have it), then fallback to plain glb.
+  // IMPORTANT: try plain first to avoid DRACO warning spam
   const candidates = [
-    "./assets/models/body.draco.glb",
     "./assets/models/body.glb",
+    "./assets/models/body.draco.glb",
   ];
 
   for (const url of candidates) {
@@ -235,14 +264,7 @@ async function loadGLBWithFallback() {
 
 function loadGLB(url) {
   clearModel();
-
   const loader = new GLTFLoader();
-
-  sep(`[GLB] start: ${url}`);
-
-  // progress % logging (throttled)
-  const lastPct = { v: -999 };
-  const lastTime = { v: 0 };
 
   return new Promise((resolve, reject) => {
     loader.load(
@@ -251,7 +273,6 @@ function loadGLB(url) {
         const model = gltf.scene;
         currentModel = model;
 
-        // Normalize transforms
         model.scale.setScalar(1);
         model.position.set(0, 0, 0);
 
@@ -259,41 +280,10 @@ function loadGLB(url) {
         scene.add(model);
         frameObject(model);
 
-        sep(`[GLB] done: ${url}`);
-        console.log("Skin shell meshes:", skinShellMeshes.length);
-        console.log("Gym muscles (clickable):", pickables.length);
-
-        // apply heat immediately
         applyHeatToAllMeshes();
-
         resolve();
       },
-      (xhr) => {
-        if (!xhr) return;
-        const total = xhr.total || 0;
-        const loaded = xhr.loaded || 0;
-
-        let pct = 0;
-        if (total > 0) pct = Math.floor((loaded / total) * 100);
-
-        // throttle: log every 5% or every 700ms
-        const now = performance.now();
-        const shouldLog =
-          total > 0
-            ? pct >= lastPct.v + 5
-            : now - lastTime.v > 700;
-
-        if (shouldLog) {
-          lastPct.v = pct;
-          lastTime.v = now;
-
-          if (total > 0) {
-            console.log(`[GLB] ${pct}% (${(loaded / 1024 / 1024).toFixed(1)}MB / ${(total / 1024 / 1024).toFixed(1)}MB)`);
-          } else {
-            console.log(`[GLB] ${(loaded / 1024 / 1024).toFixed(1)}MB loaded`);
-          }
-        }
-      },
+      undefined,
       (err) => reject(err)
     );
   });
@@ -308,9 +298,8 @@ function applyClassification(root) {
     const info = classifyMeshName(obj.name);
 
     if (info.kind === "shell") {
-      // stand-in “human” cover
       obj.material = skinMat;
-      obj.renderOrder = 2; // render after muscles
+      obj.renderOrder = 2;
       obj.frustumCulled = true;
       obj.visible = true;
       skinShellMeshes.push(obj);
@@ -318,12 +307,10 @@ function applyClassification(root) {
     }
 
     if (info.kind === "gym") {
-      // gym muscle: visible, clickable, heat-colored
       obj.visible = true;
       obj.renderOrder = 1;
       obj.frustumCulled = true;
 
-      // store baseline material per mesh so it’s independent
       const base = makeBaselineMuscleMaterial();
       obj.material = base;
       obj.userData._muscle = {
@@ -336,80 +323,21 @@ function applyClassification(root) {
       return;
     }
 
-    // ignore everything else (bones, micro, etc.)
     obj.visible = false;
   });
-
-  // small sanity log
-  const totalMeshes = [];
-  root.traverse((o) => o.isMesh && totalMeshes.push(o));
-  console.log("Total meshes:", totalMeshes.length);
-
-  // show a sample list (cleaner in console)
-  const sample = gymMeshes.slice(0, 20).map((x) => x.mesh.name);
-  sep("Sample gym muscles:");
-  console.log(sample);
 }
 
-/* ----------------------------- Picking / selection ----------------------------- */
+/* ----------------------------- Picking ----------------------------- */
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let downAt = null;
 
 function getPointerNDC(ev) {
   const rect = renderer.domElement.getBoundingClientRect();
-  const x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-  const y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
-  pointer.set(x, y);
-}
-
-function setSelected(mesh) {
-  if (selectedMesh === mesh) {
-    clearSelected();
-    return;
-  }
-
-  clearSelected();
-  selectedMesh = mesh;
-
-  if (!selectedMesh) return;
-
-  applyHeatToMesh(selectedMesh); // baseline first
-  applySelectionLook(selectedMesh);
-
-  const name = selectedMesh.name || "(unnamed)";
-  const groups = selectedMesh.userData?._muscle?.groups || [];
-  const groupText = groups.length ? groups.map(prettyGroupId).join(", ") : "Unknown";
-
-  // UI
-  if (selectedBox) {
-    selectedBox.querySelector(".selected-name").textContent = name;
-    selectedBox.querySelector(".selected-meta").textContent = groupText;
-  }
-
-  // console (with separators)
-  sep("Selected gym muscle");
-  console.log("Name:", name);
-  console.log("Groups:", groups);
-  for (const gid of groups) {
-    const h = computeHeat(state, gid, Date.now());
-    console.log(`- ${gid}: heat=${h.heat.toFixed(2)} load=${h.load.toFixed(2)} overdo=${!!h.overdo}`);
-  }
-}
-
-function clearSelected() {
-  if (!selectedMesh) return;
-
-  // remove selection look then restore heat styling
-  clearSelectionLook(selectedMesh);
-  applyHeatToMesh(selectedMesh);
-
-  selectedMesh = null;
-
-  if (selectedBox) {
-    selectedBox.querySelector(".selected-name").textContent = "None";
-    selectedBox.querySelector(".selected-meta").textContent = "Click a muscle.";
-  }
+  pointer.set(
+    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+    -(((ev.clientY - rect.top) / rect.height) * 2 - 1)
+  );
 }
 
 renderer.domElement.addEventListener("pointerdown", (ev) => {
@@ -422,164 +350,105 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
   const dy = Math.abs(ev.clientY - downAt.y);
   const dt = performance.now() - downAt.t;
   downAt = null;
-
-  // don’t select while rotating
-  const isClick = dx < 6 && dy < 6 && dt < 500;
-  if (!isClick) return;
-
-  if (!currentModel) return;
+  if (dx > 6 || dy > 6 || dt > 500) return;
 
   getPointerNDC(ev);
   raycaster.setFromCamera(pointer, camera);
-
   const hits = raycaster.intersectObjects(pickables, true);
-  if (!hits.length) {
-    clearSelected();
-    return;
-  }
-
-  // pick nearest gym mesh
-  const hit = hits[0]?.object;
-  if (!hit) {
-    clearSelected();
-    return;
-  }
-
-  setSelected(hit);
+  if (!hits.length) return clearSelected();
+  setSelected(hits[0].object);
 });
 
-/* ----------------------------- Heat application ----------------------------- */
-function getMeshHeat(mesh, now = Date.now()) {
-  const groups = mesh.userData?._muscle?.groups || [];
-  if (!groups.length) return { heat: 0, overdo: false };
-
-  // mesh heat = max of its groups (simple + effective)
-  let maxHeat = 0;
-  let anyOverdo = false;
-
-  for (const gid of groups) {
-    const h = computeHeat(state, gid, now);
-    maxHeat = Math.max(maxHeat, h.heat);
-    if (h.overdo) anyOverdo = true;
-  }
-
-  return { heat: maxHeat, overdo: anyOverdo };
+/* ----------------------------- Selection ----------------------------- */
+function prettyGroupId(id) {
+  return (id || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function setSelected(mesh) {
+  if (selectedMesh === mesh) return clearSelected();
+  clearSelected();
+  selectedMesh = mesh;
+
+  applyHeatToMesh(mesh);
+  applySelectionLook(mesh);
+
+  const groups = mesh.userData?._muscle?.groups || [];
+  selectedBox.querySelector(".selected-name").textContent = mesh.name || "(unnamed)";
+  selectedBox.querySelector(".selected-meta").textContent =
+    groups.length ? groups.map(prettyGroupId).join(", ") : "Unknown";
+}
+
+function clearSelected() {
+  if (!selectedMesh) return;
+  clearSelectionLook(selectedMesh);
+  applyHeatToMesh(selectedMesh);
+  selectedMesh = null;
+  selectedBox.querySelector(".selected-name").textContent = "None";
+  selectedBox.querySelector(".selected-meta").textContent = "Click a muscle.";
+}
+
+/* ----------------------------- Heat apply ----------------------------- */
 function applyHeatToMesh(mesh, now = Date.now()) {
-  if (!mesh?.material) return;
+  const groups = mesh.userData?._muscle?.groups || [];
+  let maxHeat = 0;
+  let overdo = false;
 
-  const { heat, overdo } = getMeshHeat(mesh, now);
-  const v = heatToVisual(heat, overdo);
-
-  // pulse override (neglect warning)
-  if (pulse && now < pulse.until) {
-    const groups = mesh.userData?._muscle?.groups || [];
-    if (groups.includes(pulse.groupId)) {
-      const t = (pulse.until - now) / 1000;
-      const p = 0.5 + 0.5 * Math.sin((1 - t) * Math.PI * 6);
-      mesh.material.emissive = new THREE.Color(0xff3c3c);
-      mesh.material.emissiveIntensity = 0.6 + p * 0.8;
-      mesh.material.color = new THREE.Color(0x7a7a7a);
-      mesh.material.wireframe = true;
-      return;
-    }
+  for (const g of groups) {
+    const h = computeHeat(state, g, now);
+    maxHeat = Math.max(maxHeat, h.heat);
+    if (h.overdo) overdo = true;
   }
 
-  // normal heat
+  const v = heatToVisual(maxHeat, overdo);
   mesh.material.color = v.color;
   mesh.material.emissive = v.emissive;
   mesh.material.emissiveIntensity = v.emissiveIntensity;
-
-  // if it’s selected, selection look will re-apply after this
   mesh.material.wireframe = false;
 }
 
 function applyHeatToAllMeshes(now = Date.now()) {
-  // decay already applied elsewhere; here is just styling
-  for (const { mesh } of gymMeshes) {
-    applyHeatToMesh(mesh, now);
-  }
-
-  // keep selection visible
-  if (selectedMesh) {
-    applySelectionLook(selectedMesh);
-  }
+  for (const { mesh } of gymMeshes) applyHeatToMesh(mesh, now);
+  if (selectedMesh) applySelectionLook(selectedMesh);
 }
 
-/* ----------------------------- Beep + neglect pulse ----------------------------- */
-function beep() {
-  // avoid spam
-  const now = Date.now();
-  if (now - lastGlobalBeepAt < 2500) return;
-  lastGlobalBeepAt = now;
-
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = "sine";
-    o.frequency.value = 880;
-    g.gain.value = 0.0001;
-
-    o.connect(g);
-    g.connect(ctx.destination);
-
-    o.start();
-    g.gain.exponentialRampToValueAtTime(0.10, ctx.currentTime + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.22);
-    o.stop(ctx.currentTime + 0.24);
-
-    o.onended = () => ctx.close();
-  } catch {
-    // ignore audio errors
-  }
+/* ----------------------------- Recs ----------------------------- */
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
 }
 
-function maybeNeglectPulse(now = Date.now()) {
-  // pick a “most neglected” group among visible gym groups:
-  // - low heat
-  // - long time since trained
-  // - not pinged recently
+function renderRecs() {
+  if (!recsBox) return;
 
-  // collect unique group ids from meshes
   const groupSet = new Set();
   for (const { groups } of gymMeshes) for (const g of groups) groupSet.add(g);
 
-  let best = null;
+  const recs = generateRecs(state, [...groupSet], Date.now());
+  recsBox.innerHTML = recs.length
+    ? recs.map((r) => `<div class="rec">${escapeHtml(r.text)}</div>`).join("")
+    : `<div class="muted">Looking balanced. Keep it up.</div>`;
+}
 
-  for (const gid of groupSet) {
-    const m = ensureMuscle(state, gid);
-    const h = computeHeat(state, gid, now);
-    const last = m.lastTrained || 0;
-    const daysSince = last ? (now - last) / (1000 * 60 * 60 * 24) : 999;
+/* ----------------------------- Logs ----------------------------- */
+function renderLogs() {
+  const out = state.logs.slice(0, 20).map((l) => `
+    <div class="log">
+      <div class="log-top">
+        <div class="log-ex">${escapeHtml(l.exerciseName)}</div>
+        <div class="log-date">${escapeHtml(l.date)}</div>
+      </div>
+      <div class="log-meta">${l.sets}×${l.reps}${(l.loadLbs ?? null) !== null ? ` • ${escapeHtml(l.loadLbs)} lbs` : ""}</div>
+    </div>
+  `).join("");
 
-    const lastPing = m.lastPing || 0;
-    const hoursSincePing = lastPing ? (now - lastPing) / (1000 * 60 * 60) : 999;
-
-    // criteria:
-    const lowHeat = h.heat < 0.14;
-    const neglected = daysSince >= 8 || last === 0;
-
-    if (!lowHeat || !neglected) continue;
-    if (hoursSincePing < 24) continue; // don’t nag constantly
-
-    const score = daysSince * 10 + (1 - h.heat) * 5; // bigger is worse
-    if (!best || score > best.score) best = { gid, score };
-  }
-
-  if (!best) return;
-
-  // pulse + beep
-  state.muscle[best.gid].lastPing = now;
-  saveState(state);
-
-  pulse = { groupId: best.gid, until: now + 1400 };
-
-  sep("Neglect nudge");
-  console.warn(`Hey champ: ${prettyGroupId(best.gid)} is lagging. Add some work.`);
-
-  beep();
+  logsBox.innerHTML = out || `<div class="muted">No logs yet.</div>`;
 }
 
 /* ----------------------------- Workout logging ----------------------------- */
@@ -602,89 +471,18 @@ function renderExerciseOptions() {
 }
 
 function computeStimulus(sets, reps, loadLbs) {
-  // Simple and stable:
-  // volume = sets*reps
-  // load factor: mild boost (so bodyweight still counts)
   const vol = Math.max(1, sets * reps);
 
   let loadFactor = 1.0;
   if (Number.isFinite(loadLbs) && loadLbs > 0) {
-    loadFactor = 1.0 + Math.min(1.0, loadLbs / 200); // cap boost
+    loadFactor = 1.0 + Math.min(1.0, loadLbs / 200);
   }
 
-  // normalize into 0..~1 range per log
-  const base = (vol / 60) * loadFactor; // 60 reps @ moderate load ~ 1.0
+  const base = (vol / 60) * loadFactor;
   return clamp01(base);
 }
 
-function addLogToState(entry) {
-  state.logs.unshift(entry);
-  // cap logs stored
-  if (state.logs.length > 250) state.logs.length = 250;
-}
-
-function renderLogs() {
-  if (!logsBox) return;
-
-  logsBox.innerHTML = "";
-
-  const logs = state.logs.slice(0, 20);
-  if (!logs.length) {
-    logsBox.innerHTML = `<div class="muted">No logs yet.</div>`;
-    return;
-  }
-
-  for (const l of logs) {
-    const el = document.createElement("div");
-    el.className = "log";
-    el.innerHTML = `
-      <div class="log-top">
-        <div class="log-ex">${escapeHtml(l.exerciseName)}</div>
-        <div class="log-date">${escapeHtml(l.date)}</div>
-      </div>
-      <div class="log-meta">
-        ${l.sets} sets × ${l.reps} reps${(l.loadLbs ?? null) !== null ? ` • ${l.loadLbs} lbs` : ""}
-      </div>
-    `;
-    logsBox.appendChild(el);
-  }
-}
-
-function renderRecs() {
-  if (!recsBox) return;
-
-  // choose group ids from current model, else from state keys
-  const groupSet = new Set();
-  for (const { groups } of gymMeshes) for (const g of groups) groupSet.add(g);
-
-  const groupIds = [...groupSet];
-  const recs = generateRecs(state, groupIds, Date.now());
-
-  if (!recs.length) {
-    recsBox.innerHTML = `<div class="muted">Looking balanced. Keep it up.</div>`;
-    return;
-  }
-
-  recsBox.innerHTML = "";
-  for (const r of recs) {
-    const div = document.createElement("div");
-    div.className = "rec";
-    div.textContent = r.text;
-    recsBox.appendChild(div);
-  }
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&":"&amp;",
-    "<":"&lt;",
-    ">":"&gt;",
-    '"':"&quot;",
-    "'":"&#39;"
-  }[c]));
-}
-
-function onLogWorkout(ev) {
+async function onLogWorkout(ev) {
   ev.preventDefault();
 
   const date = (dateInput?.value || todayISO()).trim();
@@ -697,74 +495,111 @@ function onLogWorkout(ev) {
   const loadLbsRaw = loadInput.value.trim();
   const loadLbs = loadLbsRaw === "" ? null : Math.max(0, parseFloat(loadLbsRaw));
 
-  // decay before applying new stimulus
+  // decay local view before applying new stimulus
   tickDecay(state, Date.now());
 
   const stim = computeStimulus(sets, reps, loadLbs);
 
-  // apply per group weight
+  // build muscles payload { groupId: weight }
+  const muscles = {};
   for (const [gid, w] of Object.entries(ex.w || {})) {
     if (!Number.isFinite(w)) continue;
-    applyStimulus(state, gid, stim * w, Date.now());
+    muscles[gid] = w;
+    applyStimulus(state, gid, stim * w, Date.now()); // local prediction
   }
 
-  // save log
-  addLogToState({
-    id: crypto?.randomUUID?.() || String(Date.now()),
-    date,
-    exerciseId: ex.id,
-    exerciseName: ex.name,
-    sets,
-    reps,
-    loadLbs,
-    stimulus: stim
+  // send to server (this is the real persistence)
+  await apiJson(API_WORKOUT_LOG, {
+    method: "POST",
+    body: JSON.stringify({
+      date,
+      exercise_id: ex.id,
+      exercise_name: ex.name,
+      sets,
+      reps,
+      load_lbs: loadLbs,
+      stimulus: stim,
+      muscles
+    }),
   });
 
-  saveState(state);
-
-  sep("Workout logged");
-  console.log(`${ex.name} — stimulus=${stim.toFixed(2)} (sets=${sets}, reps=${reps}, load=${loadLbs ?? "n/a"})`);
+  // reload from server to be authoritative
+  await loadLogsServer();
+  await loadMuscleStateServer();
 
   renderLogs();
   renderRecs();
   applyHeatToAllMeshes();
 
-  // keep date at what user chose; but if empty, set to today
   if (dateInput && !dateInput.value) dateInput.value = todayISO();
 }
 
+async function resetStateServer() {
+  try {
+    const res = await fetch(API_STATE_RESET, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }
+    });
+
+    const text = await res.text();
+    const json = JSON.parse(text);
+
+    return json && json.ok === true;
+  } catch (e) {
+    console.warn("[reset] failed:", e);
+    return false;
+  }
+}
+
+function makeDefaultState() {
+  return {
+    logs: [],
+    muscle: {},
+    lastUpdate: Date.now(),
+  };
+}
+
+
+
 /* ----------------------------- UI wiring ----------------------------- */
 renderExerciseOptions();
-
 if (dateInput) dateInput.value = todayISO();
 
 if (logForm) logForm.addEventListener("submit", onLogWorkout);
 
 if (recsBtn) {
-  recsBtn.addEventListener("click", () => {
+  recsBtn.addEventListener("click", async () => {
+    // just recompute UI using current state; no auto-save spam
     tickDecay(state, Date.now());
-    saveState(state);
     renderRecs();
     applyHeatToAllMeshes();
-    maybeNeglectPulse(Date.now());
   });
 }
 
 if (resetBtn) {
-  resetBtn.addEventListener("click", () => {
-    if (!confirm("Reset MuscleMap data? This clears logs + heat states.")) return;
-    resetState();
-    state = loadState();
+  resetBtn.addEventListener("click", async () => {
+    if (!confirm("Reset ALL MuscleMap data? This wipes the shared database.")) return;
+
+    const ok = await resetStateServer();
+    if (!ok) {
+      alert("Reset failed. Check server logs.");
+      return;
+    }
+
+    state = makeDefaultState();
     tickDecay(state, Date.now());
-    saveState(state);
 
     clearSelected();
     renderLogs();
     renderRecs();
     applyHeatToAllMeshes();
-    sep("Data reset");
+
+    alert("All data reset.");
   });
 }
+
 
 /* ----------------------------- Resize ----------------------------- */
 window.addEventListener("resize", () => {
@@ -774,42 +609,36 @@ window.addEventListener("resize", () => {
 });
 
 /* ----------------------------- Boot ----------------------------- */
-renderLogs();
-renderRecs();
+async function boot() {
+  await loadLogsServer();
+  await loadMuscleStateServer();
 
-loadGLBWithFallback().catch((e) => {
-  console.error(e);
-  alert("Model load failed. Put assets/models/body.glb in place.");
-});
+  // makes the view look correct immediately
+  tickDecay(state, Date.now());
 
-/* ----------------------------- Main loop ----------------------------- */
+  renderLogs();
+  renderRecs();
+
+  loadGLBWithFallback().catch((e) => {
+    console.error(e);
+    alert("Model load failed. Put assets/models/body.glb in place.");
+  });
+}
+boot();
+
+/* ----------------------------- Loop ----------------------------- */
 let lastDecayAt = Date.now();
 
 function animate() {
   requestAnimationFrame(animate);
 
-  // decay + refresh every ~2 seconds (cheap)
   const now = Date.now();
   if (now - lastDecayAt > 2000) {
     lastDecayAt = now;
     tickDecay(state, now);
-    saveState(state);
-
     applyHeatToAllMeshes(now);
     renderRecs();
-
-    // occasional nudge
-    maybeNeglectPulse(now);
   }
-
-  // pulse effect will be applied inside applyHeatToMesh when needed
-  if (pulse && now >= pulse.until) {
-    pulse = null;
-    applyHeatToAllMeshes(now);
-  }
-
-  // keep selection visible over heat
-  if (selectedMesh) applySelectionLook(selectedMesh);
 
   controls.update();
   renderer.render(scene, camera);
