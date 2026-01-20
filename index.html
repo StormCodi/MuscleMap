@@ -1,38 +1,15 @@
-cat > /var/www/html/musclemap/index.html <<'HTML'
+<!-- index.html -->
+
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>MuscleMap - Viewer</title>
-  <style>
-    html, body { height: 100%; margin: 0; background:#0c0c0c; overflow:hidden; }
-    #app { position: fixed; inset: 0; display:grid; grid-template-columns: 1fr 340px; }
-    #view { position: relative; }
-    #sidebar {
-      border-left: 1px solid rgba(255,255,255,0.08);
-      padding: 16px;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      color: rgba(255,255,255,0.85);
-      background: rgba(18,18,18,0.9);
-    }
-    .muted { color: rgba(255,255,255,0.55); font-size: 13px; line-height:1.4; }
-    .btn {
-      display:inline-block; padding:10px 12px; border-radius:10px;
-      background: rgba(255,255,255,0.08);
-      color: rgba(255,255,255,0.9);
-      border: 1px solid rgba(255,255,255,0.10);
-      cursor:pointer; user-select:none;
-      margin-top: 10px;
-    }
-    .btn:hover { background: rgba(255,255,255,0.12); }
-    @media (max-width: 900px) {
-      #app { grid-template-columns: 1fr; grid-template-rows: 1fr 280px; }
-      #sidebar { border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
-    }
-  </style>
+  <title>MuscleMap</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css" />
 
-  <!-- Importmap so addons can import from "three" -->
+  <!-- Import map for local Three.js (downloaded into ./vendor/three/) -->
   <script type="importmap">
   {
     "imports": {
@@ -42,42 +19,92 @@ cat > /var/www/html/musclemap/index.html <<'HTML'
   }
   </script>
 </head>
+
 <body>
-  <div id="app">
-    <div id="view"></div>
-    <div id="sidebar">
-      <div style="font-size:18px; font-weight:700;">MuscleMap Viewer</div>
-      <div class="muted" style="margin-top:6px;">
-        Test viewer: loads one model file.<br/>
-        Put your file at <code style="color:#fff;">assets/models/body.fbx</code>
-      </div>
+  <div class="app">
+    <div class="viewer">
+      <div id="view" class="view"></div>
 
-      <div class="btn" id="reloadBtn">Reload model</div>
-
-      <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
-        <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-          <input type="radio" name="sexModel" value="male" checked />
-          Male
-        </label>
-        <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-          <input type="radio" name="sexModel" value="female" />
-          Female
-        </label>
-      </div>
-
-      <div class="muted" style="margin-top:16px;">
-        Controls:<br/>
-        • Left drag = rotate<br/>
-        • Wheel / pinch = zoom<br/>
-        • Right drag = pan
-      </div>
-
-      <hr style="border:0; height:1px; background:rgba(255,255,255,0.08); margin:16px 0;" />
-
-      <div class="muted">
-        License note: Z-Anatomy models are CC BY-SA 4.0 (attribute if publishing).
+      <div class="hud">
+        <div class="hud-title">MuscleMap</div>
+        <div class="hud-sub">Click a muscle • Log a workout • Watch recovery colors</div>
       </div>
     </div>
+
+    <aside class="sidebar">
+      <div class="panel">
+        <div class="panel-title">Workout log</div>
+
+        <form id="logForm" class="form">
+          <label class="field">
+            <span>Date</span>
+            <input id="dateInput" type="date" />
+          </label>
+
+          <label class="field">
+            <span>Exercise</span>
+            <select id="exerciseSelect"></select>
+          </label>
+
+          <div class="row">
+            <label class="field">
+              <span>Sets</span>
+              <input id="setsInput" type="number" min="1" max="50" value="3" />
+            </label>
+            <label class="field">
+              <span>Reps</span>
+              <input id="repsInput" type="number" min="1" max="200" value="10" />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Load (lbs) (optional)</span>
+            <input id="loadInput" type="number" min="0" step="1" placeholder="e.g. 25" />
+          </label>
+
+          <button class="btn" type="submit">Log workout</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Selected</div>
+        <div id="selectedBox" class="selected">
+          <div class="selected-name">None</div>
+          <div class="selected-meta">Click a muscle.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Legend</div>
+        <div class="legend">
+          <div class="legend-row"><span class="swatch s-gray"></span><span>Untrained / baseline</span></div>
+          <div class="legend-row"><span class="swatch s-green"></span><span>Freshly trained</span></div>
+          <div class="legend-row"><span class="swatch s-yellow"></span><span>Frequent work</span></div>
+          <div class="legend-row"><span class="swatch s-orange"></span><span>High load / needs recovery</span></div>
+          <div class="legend-row"><span class="swatch s-red"></span><span>Overdoing it</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Recommendations</div>
+        <div id="recsBox" class="recs">
+          <div class="muted">Log workouts to get recs.</div>
+        </div>
+        <div class="row">
+          <button id="recsBtn" class="btn secondary" type="button">Generate recs</button>
+          <button id="resetBtn" class="btn danger" type="button">Reset data</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Recent logs</div>
+        <div id="logsBox" class="logs"></div>
+      </div>
+
+      <div class="panel footnote">
+        Models: Z-Anatomy (CC BY-SA 4.0). Attribute if publishing.
+      </div>
+    </aside>
   </div>
 
   <script type="module" src="./main.js"></script>
