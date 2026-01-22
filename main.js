@@ -3,7 +3,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-import { EXERCISES, getExerciseById } from "./lib/exercises.js";
+import {
+  getAllExercisesCached,
+  getExerciseById
+} from "./lib/exercises.js";
 import { classifyMeshName } from "./lib/muscleMap.js";
 import { tickDecay, applyStimulus, computeHeat, ensureMuscle } from "./lib/recovery.js";
 import { generateRecs } from "./lib/recs.js";
@@ -460,15 +463,18 @@ function todayISO() {
   return `${y}-${m}-${day}`;
 }
 
-function renderExerciseOptions() {
+async function renderExerciseOptions() {
   exerciseSelect.innerHTML = "";
-  for (const ex of EXERCISES) {
+
+  const list = await getAllExercisesCached();
+  for (const ex of list) {
     const opt = document.createElement("option");
     opt.value = ex.id;
     opt.textContent = ex.name;
     exerciseSelect.appendChild(opt);
   }
 }
+
 
 function computeStimulus(sets, reps, loadLbs) {
   const vol = Math.max(1, sets * reps);
@@ -487,8 +493,9 @@ async function onLogWorkout(ev) {
 
   const date = (dateInput?.value || todayISO()).trim();
   const exId = exerciseSelect.value;
-  const ex = getExerciseById(exId);
+  const ex = await getExerciseById(exId);
   if (!ex) return;
+
 
   const sets = Math.max(1, parseInt(setsInput.value || "1", 10));
   const reps = Math.max(1, parseInt(repsInput.value || "1", 10));
@@ -564,8 +571,7 @@ function makeDefaultState() {
 
 
 /* ----------------------------- UI wiring ----------------------------- */
-renderExerciseOptions();
-if (dateInput) dateInput.value = todayISO();
+
 
 if (logForm) logForm.addEventListener("submit", onLogWorkout);
 
@@ -613,17 +619,20 @@ async function boot() {
   await loadLogsServer();
   await loadMuscleStateServer();
 
-  // makes the view look correct immediately
-  tickDecay(state, Date.now());
+  await renderExerciseOptions();
 
+  if (dateInput) dateInput.value = todayISO();
+
+  tickDecay(state, Date.now());
   renderLogs();
   renderRecs();
 
   loadGLBWithFallback().catch((e) => {
     console.error(e);
-    alert("Model load failed. Put assets/models/body.glb in place.");
+    alert("Model load failed.");
   });
 }
+
 boot();
 
 /* ----------------------------- Loop ----------------------------- */
