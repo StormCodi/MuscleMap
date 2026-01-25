@@ -3,22 +3,17 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-import {
-  getAllExercisesCached,
-  getExerciseById
-} from "./lib/exercises.js";
+import { getAllExercisesCached, getExerciseById } from "./lib/exercises.js";
 import { classifyMeshName } from "./lib/muscleMap.js";
-import { tickDecay, applyStimulus, computeHeat, ensureMuscle } from "./lib/recovery.js";
+import { computeHeat } from "./lib/recovery.js";
 import { generateRecs } from "./lib/recs.js";
 
 /* ==============================
    PHP API endpoints
 ============================== */
-const API_STATE_GET    = "./api/get_muscle_state.php";
 const API_LOGS_GET     = "./api/get_logs.php";
 const API_WORKOUT_LOG  = "./api/log_workout.php";
 const API_STATE_RESET  = "./api/state_reset.php";
-
 
 /* ----------------------------- DOM refs ----------------------------- */
 const mount = document.getElementById("view");
@@ -40,9 +35,11 @@ const logsBox = document.getElementById("logsBox");
 /* ----------------------------- State ----------------------------- */
 let state = {
   logs: [],
-  muscle: {},     // { groupId: { load, lastTrained, lastPing } }
+  muscle: {},     // derived from logs: { groupId: { load, lastTrained, lastPing } }
   lastUpdate: Date.now(),
 };
+
+let exerciseWeightsById = {}; // { exerciseId: {gid: weight} }
 
 /* ----------------------------- API helpers ----------------------------- */
 async function apiJson(url, opts = {}) {
@@ -70,33 +67,11 @@ async function apiJson(url, opts = {}) {
   return data;
 }
 
-async function loadMuscleStateServer() {
-  const data = await apiJson(API_STATE_GET, { method: "GET" });
-  // expected: { ok:true, rows:[...] }
-  const rows = Array.isArray(data.rows) ? data.rows : [];
-  const muscle = {};
-
-  for (const r of rows) {
-    const gid = String(r.muscle_group || "").trim();
-    if (!gid) continue;
-
-    muscle[gid] = {
-      load: Number(r.load_value || 0),
-      lastTrained: Number(r.last_trained_at || 0) * 1000, // php returns unix seconds
-      lastPing: Number(r.last_ping_at || 0) * 1000,
-    };
-  }
-
-  state.muscle = muscle;
-  state.lastUpdate = Date.now();
-}
-
+/* ----------------------------- Logs ----------------------------- */
 async function loadLogsServer() {
   const data = await apiJson(API_LOGS_GET, { method: "GET" });
-  // expected: { ok:true, rows:[...] }
   const rows = Array.isArray(data.rows) ? data.rows : [];
 
-  // normalize to match your renderLogs()
   state.logs = rows.map((r) => ({
     id: String(r.id),
     date: String(r.workout_date),
@@ -106,9 +81,79 @@ async function loadLogsServer() {
     reps: Number(r.reps),
     loadLbs: r.load_lbs === null || r.load_lbs === undefined ? null : Number(r.load_lbs),
     stimulus: Number(r.stimulus),
+    createdAt: String(r.created_at || ""),
+    muscles: (() => {
+      const mj = r.muscles_json;
+      if (!mj) return null;
+      if (typeof mj === "object") return mj;
+      if (typeof mj === "string") {
+        try { return JSON.parse(mj); } catch { return null; }
+      }
+      return null;
+    })(),
   }));
 
   state.lastUpdate = Date.now();
+}
+
+/* ----------------------------- Derived muscle state from logs ----------------------------- */
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+function hours(ms) {
+  return ms / (1000 * 60 * 60);
+}
+function parseSqlDateTime(s) {
+  // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS"
+  if (!s) return null;
+  const iso = s.replace(" ", "T");
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function rebuildMuscleFromLogs(now = Date.now()) {
+  const muscle = {};
+  const halfLifeHrs = 36;
+
+  const ensure = (gid) => {
+    if (!muscle[gid]) muscle[gid] = { load: 0, lastTrained: 0, lastPing: 0 };
+    return muscle[gid];
+  };
+
+  for (const l of state.logs) {
+    const dt = parseSqlDateTime(l.createdAt);
+    if (!dt) continue;
+    const tMs = dt.getTime();
+
+    const ageMs = now - tMs;
+    const decay = Math.pow(0.5, hours(ageMs) / halfLifeHrs);
+
+    const wmap =
+      (l.muscles && typeof l.muscles === "object")
+        ? l.muscles
+        : (exerciseWeightsById[l.exerciseId] || null);
+
+    if (!wmap) continue;
+
+    const stim = Number(l.stimulus) || 0;
+    if (!(stim > 0)) continue;
+
+    for (const [gidRaw, wRaw] of Object.entries(wmap)) {
+      const gid = String(gidRaw || "").trim();
+      const w = Number(wRaw);
+      if (!gid || !Number.isFinite(w) || w <= 0) continue;
+
+      const m = ensure(gid);
+      const add = stim * w * decay;
+      if (!(add > 0)) continue;
+
+      m.load = clamp01(m.load + add);
+      m.lastTrained = Math.max(m.lastTrained, tMs);
+    }
+  }
+
+  state.muscle = muscle;
+  state.lastUpdate = now;
 }
 
 /* ----------------------------- Three.js setup ----------------------------- */
@@ -193,10 +238,6 @@ function clearSelectionLook(mesh) {
 }
 
 /* ----------------------------- Heat ----------------------------- */
-function clamp01(x) {
-  return Math.max(0, Math.min(1, x));
-}
-
 function heatToVisual(heat, overdo) {
   const h = clamp01(heat);
 
@@ -247,7 +288,6 @@ function clearModel() {
 }
 
 async function loadGLBWithFallback() {
-  // IMPORTANT: try plain first to avoid DRACO warning spam
   const candidates = [
     "./assets/models/body.glb",
     "./assets/models/body.draco.glb",
@@ -439,7 +479,7 @@ function renderRecs() {
     : `<div class="muted">Looking balanced. Keep it up.</div>`;
 }
 
-/* ----------------------------- Logs ----------------------------- */
+/* ----------------------------- Logs UI ----------------------------- */
 function renderLogs() {
   const out = state.logs.slice(0, 20).map((l) => `
     <div class="log">
@@ -467,6 +507,13 @@ async function renderExerciseOptions() {
   exerciseSelect.innerHTML = "";
 
   const list = await getAllExercisesCached();
+
+  // build a fast lookup for fallback (older logs without muscles_json)
+  exerciseWeightsById = {};
+  for (const ex of list) {
+    exerciseWeightsById[ex.id] = ex.w || {};
+  }
+
   for (const ex of list) {
     const opt = document.createElement("option");
     opt.value = ex.id;
@@ -474,7 +521,6 @@ async function renderExerciseOptions() {
     exerciseSelect.appendChild(opt);
   }
 }
-
 
 function computeStimulus(sets, reps, loadLbs) {
   const vol = Math.max(1, sets * reps);
@@ -496,26 +542,20 @@ async function onLogWorkout(ev) {
   const ex = await getExerciseById(exId);
   if (!ex) return;
 
-
   const sets = Math.max(1, parseInt(setsInput.value || "1", 10));
   const reps = Math.max(1, parseInt(repsInput.value || "1", 10));
   const loadLbsRaw = loadInput.value.trim();
   const loadLbs = loadLbsRaw === "" ? null : Math.max(0, parseFloat(loadLbsRaw));
 
-  // decay local view before applying new stimulus
-  tickDecay(state, Date.now());
-
   const stim = computeStimulus(sets, reps, loadLbs);
 
-  // build muscles payload { groupId: weight }
+  // snapshot muscles map
   const muscles = {};
   for (const [gid, w] of Object.entries(ex.w || {})) {
     if (!Number.isFinite(w)) continue;
     muscles[gid] = w;
-    applyStimulus(state, gid, stim * w, Date.now()); // local prediction
   }
 
-  // send to server (this is the real persistence)
   await apiJson(API_WORKOUT_LOG, {
     method: "POST",
     body: JSON.stringify({
@@ -530,9 +570,8 @@ async function onLogWorkout(ev) {
     }),
   });
 
-  // reload from server to be authoritative
   await loadLogsServer();
-  await loadMuscleStateServer();
+  rebuildMuscleFromLogs(Date.now());
 
   renderLogs();
   renderRecs();
@@ -568,17 +607,12 @@ function makeDefaultState() {
   };
 }
 
-
-
 /* ----------------------------- UI wiring ----------------------------- */
-
-
 if (logForm) logForm.addEventListener("submit", onLogWorkout);
 
 if (recsBtn) {
   recsBtn.addEventListener("click", async () => {
-    // just recompute UI using current state; no auto-save spam
-    tickDecay(state, Date.now());
+    rebuildMuscleFromLogs(Date.now());
     renderRecs();
     applyHeatToAllMeshes();
   });
@@ -595,7 +629,6 @@ if (resetBtn) {
     }
 
     state = makeDefaultState();
-    tickDecay(state, Date.now());
 
     clearSelected();
     renderLogs();
@@ -605,7 +638,6 @@ if (resetBtn) {
     alert("All data reset.");
   });
 }
-
 
 /* ----------------------------- Resize ----------------------------- */
 window.addEventListener("resize", () => {
@@ -617,13 +649,11 @@ window.addEventListener("resize", () => {
 /* ----------------------------- Boot ----------------------------- */
 async function boot() {
   await loadLogsServer();
-  await loadMuscleStateServer();
-
   await renderExerciseOptions();
 
   if (dateInput) dateInput.value = todayISO();
 
-  tickDecay(state, Date.now());
+  rebuildMuscleFromLogs(Date.now());
   renderLogs();
   renderRecs();
 
@@ -636,15 +666,15 @@ async function boot() {
 boot();
 
 /* ----------------------------- Loop ----------------------------- */
-let lastDecayAt = Date.now();
+let lastRebuildAt = Date.now();
 
 function animate() {
   requestAnimationFrame(animate);
 
   const now = Date.now();
-  if (now - lastDecayAt > 2000) {
-    lastDecayAt = now;
-    tickDecay(state, now);
+  if (now - lastRebuildAt > 2000) {
+    lastRebuildAt = now;
+    rebuildMuscleFromLogs(now);
     applyHeatToAllMeshes(now);
     renderRecs();
   }

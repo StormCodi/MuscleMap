@@ -26,8 +26,6 @@ register_shutdown_function(function(){
   }
 });
 
-header("Content-Type: application/json");
-
 require __DIR__ . "/db.php";
 
 $raw = file_get_contents("php://input");
@@ -63,15 +61,18 @@ if (!is_array($muscles)) {
   exit;
 }
 
-$now = date("Y-m-d H:i:s");
-$trainedAt = time(); // keep unix for muscle_state if those columns are INT
+// Store snapshot on the log row so future exercise weight edits don't rewrite history
+$muscles_json = json_encode($muscles, JSON_UNESCAPED_SLASHES);
+if ($muscles_json === false) $muscles_json = null;
 
-// Insert workout log
+$now = date("Y-m-d H:i:s");
+
+// Insert workout log (single source of truth)
 $ins = $pdo->prepare("
   INSERT INTO workout_logs
-    (user_id, workout_date, exercise_id, exercise_name, sets, reps, load_lbs, stimulus, created_at)
+    (user_id, workout_date, exercise_id, exercise_name, sets, reps, load_lbs, stimulus, created_at, muscles_json)
   VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ");
 $ins->execute([
   GLOBAL_USER_ID,
@@ -82,29 +83,8 @@ $ins->execute([
   $reps,
   $load_lbs,
   $stimulus,
-  $now
+  $now,
+  $muscles_json
 ]);
-
-// Update muscle_state: add load_value (capped), set last_trained_at
-$up = $pdo->prepare("
-  INSERT INTO muscle_state
-    (user_id, muscle_group, load_value, last_trained_at, last_ping_at)
-  VALUES
-    (?, ?, ?, ?, 0)
-  ON DUPLICATE KEY UPDATE
-    load_value = LEAST(1.0, load_value + VALUES(load_value)),
-    last_trained_at = VALUES(last_trained_at)
-");
-
-foreach ($muscles as $group => $weight) {
-  if (!is_string($group) || $group === "") continue;
-  if (!is_numeric($weight)) continue;
-
-  $delta = $stimulus * (float)$weight;
-  if ($delta <= 0) continue;
-
-$up->execute([GLOBAL_USER_ID, $group, $delta, $trainedAt]);
-
-}
 
 echo json_encode(["ok" => true]);
