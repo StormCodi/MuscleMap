@@ -36,13 +36,22 @@
         <div id="chatLog" class="chatLog"></div>
 
         <form id="composer" class="composer">
-          <input id="msgInput" class="msgInput" type="text" placeholder="Describe the exercise…" autocomplete="off" />
-          <input id="imgInput" class="imgInput" type="file" accept="image/*" capture="environment" />
-          <button id="sendBtn" class="btn" type="submit">Send</button>
+          <div class="composerInner">
+            <div id="attachStrip" class="attachStrip" aria-label="Selected images"></div>
+
+            <div class="composerRow">
+              <input id="msgInput" class="msgInput" type="text" placeholder="Describe the exercise…" autocomplete="off" />
+              <label class="imgPick" title="Add images">
+                <input id="imgInput" type="file" accept="image/*" multiple />
+                <span class="imgPickBtn">📷</span>
+              </label>
+              <button id="sendBtn" class="btn" type="submit" disabled>Send</button>
+            </div>
+          </div>
         </form>
       </section>
 
-      <aside class="aiSide">
+      <aside class="aiSide" id="aiSide">
         <div class="sideCard">
           <div class="sideTitle" id="previewTitle">No proposal yet</div>
           <div class="sideSub" id="previewSub">When AI proposes an exercise, muscles will highlight here.</div>
@@ -57,5 +66,6 @@
     </main>
 
     <script type="module" src="./ai_chat.js"></script>
+  </div>
 </body>
 </html>

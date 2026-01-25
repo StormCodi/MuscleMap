@@ -17,9 +17,7 @@ function readApiKey(): string {
   return $key === false ? "" : trim($key);
 }
 
-function clamp01(float $x): float {
-  return max(0.0, min(1.0, $x));
-}
+function clamp01(float $x): float { return max(0.0, min(1.0, $x)); }
 
 function normalizeId(string $s): string {
   $s = strtolower(trim($s));
@@ -29,6 +27,12 @@ function normalizeId(string $s): string {
   if (strlen($s) < 2) $s = "ex_" . $s;
   if (strlen($s) > 64) $s = substr($s, 0, 64);
   if (!preg_match('/^[a-z0-9_]{2,64}$/', $s)) $s = "ex_" . bin2hex(random_bytes(4));
+  return $s;
+}
+
+function normalizeName(string $s): string {
+  $s = mb_strtolower(trim($s));
+  $s = preg_replace('/\s+/', ' ', $s) ?? $s;
   return $s;
 }
 
@@ -46,12 +50,6 @@ function weightsNormalize($w): array {
   return $out;
 }
 
-function normalizeName(string $s): string {
-  $s = mb_strtolower(trim($s));
-  $s = preg_replace('/\s+/', ' ', $s) ?? $s;
-  return $s;
-}
-
 function exactMatchExercise(array $dbExercises, string $name, array $weights): ?array {
   $nName = normalizeName($name);
   $nW = weightsNormalize($weights);
@@ -64,7 +62,6 @@ function exactMatchExercise(array $dbExercises, string $name, array $weights): ?
 }
 
 function assistantTextFromContent($content): string {
-  // xAI may return string or array parts
   if (is_string($content)) return $content;
   if (is_array($content)) {
     $out = "";
@@ -79,33 +76,32 @@ function assistantTextFromContent($content): string {
 }
 
 /* ─────────────────────────────
-   Input
+   Input: JSON body (preferred) OR fallback form payload
+   Your frontend sends JSON: { history, text, image_tokens }
+   NOTE: images are NOT required.
 ───────────────────────────── */
-$payloadRaw = $_POST["payload"] ?? "";
-if (!is_string($payloadRaw) || $payloadRaw === "") bad("missing_payload");
+$rawBody = file_get_contents("php://input");
+$payload = null;
 
-$payload = json_decode($payloadRaw, true);
-if (!is_array($payload)) bad("bad_payload_json");
+if (is_string($rawBody) && trim($rawBody) !== "") {
+  $payload = json_decode($rawBody, true);
+  if (!is_array($payload)) bad("bad_json");
+} else {
+  // fallback (older)
+  $payloadRaw = $_POST["payload"] ?? "";
+  if (!is_string($payloadRaw) || $payloadRaw === "") bad("missing_payload");
+  $payload = json_decode($payloadRaw, true);
+  if (!is_array($payload)) bad("bad_payload_json");
+}
 
 $history = $payload["history"] ?? [];
 $text = trim((string)($payload["text"] ?? ""));
+$imageTokens = $payload["image_tokens"] ?? [];
 
 if (!is_array($history)) $history = [];
+if (!is_array($imageTokens)) $imageTokens = [];
 
-$hasImage = isset($_FILES["image"]) && is_array($_FILES["image"]) && (($_FILES["image"]["error"] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK);
-
-if ($text === "" && !$hasImage) bad("missing_input");
-
-$imageDataUrl = null;
-if ($hasImage) {
-  $tmp = (string)$_FILES["image"]["tmp_name"];
-  $mime = @mime_content_type($tmp) ?: "";
-  if (!in_array($mime, ["image/jpeg", "image/png"], true)) bad("bad_image_type");
-  $bytes = @file_get_contents($tmp);
-  if ($bytes === false || $bytes === "") bad("bad_image");
-  $b64 = base64_encode($bytes);
-  $imageDataUrl = "data:$mime;base64,$b64";
-}
+if ($text === "" && count($imageTokens) === 0) bad("missing_input");
 
 /* ─────────────────────────────
    Load ALL exercises (name + weights)
@@ -129,8 +125,6 @@ try {
       "w" => weightsNormalize($w),
     ];
   }
-
-  // Give the model the full list (names + weights), so it stops hallucinating duplicates
   $exJson = json_encode($dbExercises, JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
   bad("db_error", 500);
@@ -152,40 +146,89 @@ $allowedSet = array_fill_keys($allowedIds, true);
 $allowedStr = implode(", ", $allowedIds);
 
 /* ─────────────────────────────
-   System prompt (strict JSON)
+   Resolve uploaded image tokens -> data URLs
+   Expects files stored by ai_upload.php in /uploads/ai_tmp/{token}.{ext}
+   Accepts jpg/png/webp.
+───────────────────────────── */
+$baseDir = realpath(__DIR__ . "/.."); // /var/www/html/musclemap
+if ($baseDir === false) bad("base_dir_fail", 500);
+
+$imgDir = $baseDir . "/uploads/ai_tmp";
+$imageDataUrls = [];
+
+$imageTokens = array_values(array_filter($imageTokens, fn($t) => is_string($t) && preg_match('/^[a-f0-9]{32}$/', $t)));
+if (count($imageTokens) > 6) $imageTokens = array_slice($imageTokens, 0, 6);
+
+$exts = ["jpg","jpeg","png","webp"];
+$mimeMap = ["jpg"=>"image/jpeg","jpeg"=>"image/jpeg","png"=>"image/png","webp"=>"image/webp"];
+
+foreach ($imageTokens as $tok) {
+  $path = null;
+  $extFound = null;
+  foreach ($exts as $ext) {
+    $p = $imgDir . "/" . $tok . "." . $ext;
+    if (is_file($p)) { $path = $p; $extFound = $ext; break; }
+  }
+  if ($path === null) continue; // token missing -> ignore (don’t hard fail)
+
+  $bytes = @file_get_contents($path);
+  if ($bytes === false || $bytes === "") continue;
+
+  $mime = $mimeMap[$extFound] ?? (@mime_content_type($path) ?: "");
+  if ($mime === "" || !in_array($mime, ["image/jpeg","image/png","image/webp"], true)) continue;
+
+  $b64 = base64_encode($bytes);
+  $imageDataUrls[] = "data:$mime;base64,$b64";
+}
+
+/* ─────────────────────────────
+   System prompt (supports multiple proposals)
 ───────────────────────────── */
 $system = <<<SYS
 You are MuscleMap's chat intake assistant.
 
 Return ONLY valid JSON. No markdown. No extra text.
 
-Your job each turn:
-- Understand the user's message (and optional image).
-- Reply with one type:
-  "error" | "question" | "exists" | "propose_add"
+Reply types:
+- "error"
+- "question"
+- "exists"
+- "propose_add"
+- "propose_add_many"  (multiple independent proposals)
 
 Rules:
 - "exists" ONLY if it is EXACTLY the same as a DB entry (same name + same weights).
-- If it's a variation, use "propose_add".
-- For propose_add: 1–6 groups, weights 0.0–1.0 realistic.
+- For proposals: 1–6 muscle groups, weights 0.0–1.0 realistic.
 - Allowed muscle group ids ONLY: [$allowedStr]
 - exercise_key: snake_case [a-z0-9_]{2,64}
 - confidence: 0.0–1.0
 - If unsure, ask a question.
 
-JSON schema (exact keys):
+JSON schema (exact keys, no extras):
 {
-  "type": "error" | "question" | "exists" | "propose_add",
+  "type": "error" | "question" | "exists" | "propose_add" | "propose_add_many",
   "text": "string",
-  "choices": ["string", ...],
-  "id": "exercise_key",
-  "name": "string",
-  "proposal": {
+
+  "choices": ["string", ...],  // optional, only for question
+
+  "id": "exercise_key",        // only for exists
+  "name": "string",            // only for exists
+
+  "proposal": {                // only for propose_add
     "exercise_key": "string",
     "name": "string",
     "weights": { "group_id": number, ... },
     "confidence": number
-  }
+  },
+
+  "proposals": [               // only for propose_add_many
+    {
+      "exercise_key": "string",
+      "name": "string",
+      "weights": { "group_id": number, ... },
+      "confidence": number
+    }
+  ]
 }
 
 Existing exercises (id, name, weights) JSON:
@@ -193,15 +236,13 @@ $exJson
 SYS;
 
 /* ─────────────────────────────
-   Build model messages (include history)
+   Build messages (include history)
 ───────────────────────────── */
 $modelMessages = [
   ["role" => "system", "content" => $system],
 ];
 
-// history: keep it sane server-side too
 $history = array_slice($history, -40);
-
 foreach ($history as $m) {
   if (!is_array($m)) continue;
   $role = strtolower((string)($m["role"] ?? ""));
@@ -212,13 +253,13 @@ foreach ($history as $m) {
 }
 
 $currentContent = [];
-if ($imageDataUrl) {
+foreach ($imageDataUrls as $u) {
   $currentContent[] = [
     "type" => "image_url",
-    "image_url" => ["url" => $imageDataUrl, "detail" => "high"]
+    "image_url" => ["url" => $u, "detail" => "high"]
   ];
 }
-$currentContent[] = ["type" => "text", "text" => ($text !== "" ? $text : "(image only — describe the exercise)")];
+$currentContent[] = ["type" => "text", "text" => ($text !== "" ? $text : "(images only — describe what exercise(s) these show)")];
 
 $modelMessages[] = ["role" => "user", "content" => $currentContent];
 
@@ -232,7 +273,7 @@ $requestPayload = [
   "model" => "grok-4-0709",
   "messages" => $modelMessages,
   "temperature" => 0.2,
-  "max_tokens" => 1200,
+  "max_tokens" => 1400,
 ];
 
 $ch = curl_init("https://api.x.ai/v1/chat/completions");
@@ -278,35 +319,23 @@ if (!is_array($assistantJson) || !isset($assistantJson["type"])) {
 }
 
 /* ─────────────────────────────
-   Server-side enforcement:
-   - validate propose_add weights
-   - force exists only on exact match
+   Normalize + server-side enforcement
 ───────────────────────────── */
 $reply = $assistantJson;
 $type = (string)($reply["type"] ?? "error");
 
-if ($type === "exists") {
-  $rid = (string)($reply["id"] ?? "");
-  $rname = (string)($reply["name"] ?? "");
-  // exists requires exact match by name+weights — we require weights too, so downgrade if missing
-  // If model didn’t include weights, we can’t verify exactness -> question
-  $reply = [
-    "type" => "question",
-    "text" => "I need one detail to confirm exact match: what muscles should this hit (main ones)?",
-    "choices" => ["Triceps", "Biceps", "Chest", "Back", "Legs", "Core"],
-  ];
-}
+// helper: normalize a proposal and validate weights+allowed groups
+$normProposal = function($p) use ($allowedSet, $dbExercises) {
+  if (!is_array($p)) return null;
 
-if ($type === "propose_add" && isset($reply["proposal"]) && is_array($reply["proposal"])) {
-  $p = $reply["proposal"];
-  $pKey = normalizeId((string)($p["exercise_key"] ?? ""));
-  $pName = trim((string)($p["name"] ?? ""));
-  $pConf = clamp01((float)($p["confidence"] ?? 0.5));
-  $pWraw = $p["weights"] ?? null;
+  $key = normalizeId((string)($p["exercise_key"] ?? ""));
+  $name = trim((string)($p["name"] ?? ""));
+  $conf = clamp01((float)($p["confidence"] ?? 0.5));
 
+  $wraw = $p["weights"] ?? null;
   $cleanW = [];
-  if (is_array($pWraw)) {
-    foreach ($pWraw as $k => $v) {
+  if (is_array($wraw)) {
+    foreach ($wraw as $k => $v) {
       if (!is_string($k)) continue;
       if (!isset($allowedSet[$k])) continue;
       if (!is_numeric($v)) continue;
@@ -315,42 +344,97 @@ if ($type === "propose_add" && isset($reply["proposal"]) && is_array($reply["pro
       $cleanW[$k] = $fv;
     }
   }
+
   arsort($cleanW);
   $cleanW = array_slice($cleanW, 0, 6, true);
   ksort($cleanW);
 
-  if ($pName === "" || !$cleanW) {
+  if ($name === "" || !$cleanW) return null;
+
+  // exact match check
+  $match = exactMatchExercise($dbExercises, $name, $cleanW);
+  if ($match) {
+    return [
+      "__kind" => "exists",
+      "id" => (string)$match["id"],
+      "name" => (string)$match["name"],
+    ];
+  }
+
+  return [
+    "__kind" => "proposal",
+    "exercise_key" => $key,
+    "name" => $name,
+    "weights" => $cleanW,
+    "confidence" => $conf,
+  ];
+};
+
+if ($type === "propose_add") {
+  $p = $normProposal($reply["proposal"] ?? null);
+  if ($p === null) {
     $reply = [
       "type" => "question",
-      "text" => "I’m not confident enough yet. What’s the exact exercise name and the main muscle it targets?",
+      "text" => "I’m not confident yet. What’s the exact exercise name and the main muscle it targets?",
       "choices" => ["Triceps", "Biceps", "Chest", "Back", "Legs", "Core"],
     ];
+  } else if (($p["__kind"] ?? "") === "exists") {
+    $reply = [
+      "type" => "exists",
+      "text" => "Exact match already exists in the database.",
+      "id" => $p["id"],
+      "name" => $p["name"],
+    ];
   } else {
-    // exact-match check across ALL exercises
-    $match = exactMatchExercise($dbExercises, $pName, $cleanW);
-    if ($match) {
+    unset($p["__kind"]);
+    $reply["proposal"] = $p;
+  }
+} elseif ($type === "propose_add_many") {
+  $arr = $reply["proposals"] ?? null;
+  if (!is_array($arr) || !$arr) {
+    $reply = [
+      "type" => "question",
+      "text" => "I can propose multiple exercises, but I need a clearer description. What are the exercise names?",
+    ];
+  } else {
+    $outProposals = [];
+    $foundExists = [];
+    foreach (array_slice($arr, 0, 6) as $p0) {
+      $p = $normProposal($p0);
+      if ($p === null) continue;
+      if (($p["__kind"] ?? "") === "exists") $foundExists[] = $p;
+      else { unset($p["__kind"]); $outProposals[] = $p; }
+    }
+
+    if ($foundExists && !$outProposals) {
+      $e = $foundExists[0];
       $reply = [
         "type" => "exists",
         "text" => "Exact match already exists in the database.",
-        "id" => (string)$match["id"],
-        "name" => (string)$match["name"],
+        "id" => $e["id"],
+        "name" => $e["name"],
+      ];
+    } elseif (!$outProposals) {
+      $reply = [
+        "type" => "question",
+        "text" => "I couldn’t form valid proposals. Tell me each exercise name and what muscles it hits.",
       ];
     } else {
-      $reply["proposal"] = [
-        "exercise_key" => $pKey,
-        "name" => $pName,
-        "weights" => $cleanW,
-        "confidence" => $pConf,
-      ];
+      $reply["proposals"] = $outProposals;
     }
   }
+} elseif (!in_array($type, ["error","question","exists"], true)) {
+  $reply = [
+    "type" => "error",
+    "text" => "Unknown reply type from model.",
+  ];
 }
 
 /* ─────────────────────────────
-   Return updated history (text only; no huge base64 stored)
+   Return updated history (text-only)
 ───────────────────────────── */
 $nextHistory = $history;
-$nextHistory[] = ["role" => "user", "text" => $text !== "" ? $text : "(image)"];
+$nextHistory[] = ["role" => "user", "text" => ($text !== "" ? $text : "(images)")];
 $nextHistory[] = ["role" => "assistant", "text" => (string)($reply["text"] ?? "")];
 
 echo json_encode([
@@ -359,7 +443,7 @@ echo json_encode([
     "role" => "assistant",
     "text" => (string)($reply["text"] ?? "(no message)"),
     "reply" => $reply,
-    "raw_json" => $assistantJson, // debug
+    "raw_json" => $assistantJson,
   ],
   "history" => $nextHistory,
 ], JSON_UNESCAPED_SLASHES);
