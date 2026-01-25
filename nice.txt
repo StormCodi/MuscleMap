@@ -1,0 +1,1503 @@
+MuscleMap Refactor Snapshot (SAFE)
+Generated: 2026-01-25T12:14:22
+Project root: /var/www/html/musclemap
+================================================================================
+
+
+################################################################################
+# FILE: api/db.php
+################################################################################
+
+<?php
+// api/db.php
+
+declare(strict_types=1);
+
+$DB_HOST = [REDACTED];
+$DB_NAME = [REDACTED];
+$DB_USER = [REDACTED];
+$DB_PASS = [REDACTED];        // CHANGE
+
+$dsn = "mysql:host={$DB_HOST};dbname={$DB_NAME};charset=utf8mb4";
+
+$options = [
+  PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+  PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+  PDO::ATTR_EMULATE_PREPARES => false,
+];
+
+$pdo = new PDO($dsn, $DB_USER, $DB_PASS, $options);
+
+// global user for now (shared DB)
+define("GLOBAL_USER_ID", 0);
+
+################################################################################
+# FILE: api/get_logs.php
+################################################################################
+
+<?php
+// api/get_logs.php
+header("Content-Type: application/json; charset=utf-8");
+
+require __DIR__ . "/db.php";
+
+$stmt = $pdo->prepare("
+  SELECT
+    id,
+    workout_date,
+    exercise_id,
+    exercise_name,
+    sets,
+    reps,
+    load_lbs,
+    stimulus,
+    created_at,
+    muscles_json
+  FROM workout_logs
+  WHERE user_id = ?
+  ORDER BY workout_date DESC, id DESC
+  LIMIT 250
+");
+$stmt->execute([GLOBAL_USER_ID]);
+
+echo json_encode([
+  "ok" => true,
+  "rows" => $stmt->fetchAll(),
+]);
+
+################################################################################
+# FILE: api/log_workout.php
+################################################################################
+
+<?php
+// api/log_workout.php
+
+header("Content-Type: application/json; charset=utf-8");
+
+// TEMP: show fatal errors as JSON (turn off after it's fixed)
+ini_set("display_errors", "1");
+ini_set("display_startup_errors", "1");
+error_reporting(E_ALL);
+
+set_exception_handler(function($e){
+  http_response_code(500);
+  echo json_encode(["ok"=>false,"error"=>"EXCEPTION: ".$e->getMessage()]);
+  exit;
+});
+set_error_handler(function($severity,$message,$file,$line){
+  http_response_code(500);
+  echo json_encode(["ok"=>false,"error"=>"PHP ERROR: $message ($file:$line)"]);
+  exit;
+});
+register_shutdown_function(function(){
+  $e = error_get_last();
+  if ($e && in_array($e["type"], [E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR], true)) {
+    http_response_code(500);
+    echo json_encode(["ok"=>false,"error"=>"FATAL: {$e["message"]} ({$e["file"]}:{$e["line"]})"]);
+  }
+});
+
+require __DIR__ . "/db.php";
+
+$raw = file_get_contents("php://input");
+$data = json_decode($raw, true);
+
+if (!is_array($data)) {
+  http_response_code(400);
+  echo json_encode(["ok" => false, "error" => "Invalid JSON"]);
+  exit;
+}
+
+$required = ["date","exercise_id","exercise_name","sets","reps","stimulus","muscles"];
+foreach ($required as $k) {
+  if (!array_key_exists($k, $data)) {
+    http_response_code(400);
+    echo json_encode(["ok" => false, "error" => "Missing $k"]);
+    exit;
+  }
+}
+
+$date          = (string)$data["date"];
+$exercise_id   = (string)$data["exercise_id"];
+$exercise_name = (string)$data["exercise_name"];
+$sets          = (int)$data["sets"];
+$reps          = (int)$data["reps"];
+$stimulus      = (float)$data["stimulus"];
+$load_lbs      = array_key_exists("load_lbs", $data) && $data["load_lbs"] !== null ? (float)$data["load_lbs"] : null;
+
+$muscles = $data["muscles"];
+if (!is_array($muscles)) {
+  http_response_code(400);
+  echo json_encode(["ok" => false, "error" => "muscles must be an object map"]);
+  exit;
+}
+
+// Store snapshot on the log row so future exercise weight edits don't rewrite history
+$muscles_json = json_encode($muscles, JSON_UNESCAPED_SLASHES);
+if ($muscles_json === false) $muscles_json = null;
+
+$now = date("Y-m-d H:i:s");
+
+// Insert workout log (single source of truth)
+$ins = $pdo->prepare("
+  INSERT INTO workout_logs
+    (user_id, workout_date, exercise_id, exercise_name, sets, reps, load_lbs, stimulus, created_at, muscles_json)
+  VALUES
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+");
+$ins->execute([
+  GLOBAL_USER_ID,
+  $date,
+  $exercise_id,
+  $exercise_name,
+  $sets,
+  $reps,
+  $load_lbs,
+  $stimulus,
+  $now,
+  $muscles_json
+]);
+
+echo json_encode(["ok" => true]);
+
+################################################################################
+# FILE: api/state_reset.php
+################################################################################
+
+<?php
+// api/state_reset.php
+header("Content-Type: application/json; charset=utf-8");
+
+require __DIR__ . "/db.php";
+
+try {
+  $del = $pdo->prepare("DELETE FROM workout_logs WHERE user_id = ?");
+  $del->execute([GLOBAL_USER_ID]);
+
+  echo json_encode([
+    "ok" => true,
+    "deleted_logs" => $del->rowCount(),
+  ]);
+} catch (Throwable $e) {
+  http_response_code(500);
+  echo json_encode(["ok" => false, "error" => "EXCEPTION: " . $e->getMessage()]);
+}
+
+################################################################################
+# FILE: index.html
+################################################################################
+
+<!-- index.html -->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MuscleMap</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css" />
+
+  <!-- Import map for local Three.js (downloaded into ./vendor/three/) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three/build/three.module.js",
+      "three/addons/": "./vendor/three/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div class="app">
+    <div class="viewer">
+      <div id="view" class="view"></div>
+
+      <div class="hud">
+        <div class="hud-title">MuscleMap</div>
+        <div class="hud-sub">Click a muscle • Log a workout • Watch recovery colors</div>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="panel">
+        <div class="panel-title">Workout log</div>
+
+        <form id="logForm" class="form">
+          <label class="field">
+            <span>Date</span>
+            <input id="dateInput" type="date" />
+          </label>
+
+          <label class="field">
+            <span>Exercise</span>
+            <select id="exerciseSelect"></select>
+          </label>
+
+          <div class="row">
+            <label class="field">
+              <span>Sets</span>
+              <input id="setsInput" type="number" min="1" max="50" value="3" />
+            </label>
+            <label class="field">
+              <span>Reps</span>
+              <input id="repsInput" type="number" min="1" max="200" value="10" />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Load (lbs) (optional)</span>
+            <input id="loadInput" type="number" min="0" step="1" placeholder="e.g. 25" />
+          </label>
+
+          <button class="btn" type="submit">Log workout</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Selected</div>
+        <div id="selectedBox" class="selected">
+          <div class="selected-name">None</div>
+          <div class="selected-meta">Click a muscle.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Legend</div>
+        <div class="legend">
+          <div class="legend-row"><span class="swatch s-gray"></span><span>Untrained / baseline</span></div>
+          <div class="legend-row"><span class="swatch s-green"></span><span>Freshly trained</span></div>
+          <div class="legend-row"><span class="swatch s-yellow"></span><span>Frequent work</span></div>
+          <div class="legend-row"><span class="swatch s-orange"></span><span>High load / needs recovery</span></div>
+          <div class="legend-row"><span class="swatch s-red"></span><span>Overdoing it</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Recommendations</div>
+        <div id="recsBox" class="recs">
+          <div class="muted">Log workouts to get recs.</div>
+        </div>
+        <div class="row">
+          <button id="recsBtn" class="btn secondary" type="button">Generate recs</button>
+          <button id="resetBtn" class="btn danger" type="button">Reset data</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Recent logs</div>
+        <div id="logsBox" class="logs"></div>
+      </div>
+
+      <div class="panel footnote">
+        Models: Z-Anatomy (CC BY-SA 4.0). Attribute if publishing.
+      </div>
+    </aside>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
+
+################################################################################
+# FILE: style.css
+################################################################################
+
+:root{
+  --bg:#0b0b0c;
+  --panel:#111114;
+  --panel2:#141419;
+  --text:#e8e8ea;
+  --muted:#9a9aa3;
+  --line:#24242b;
+  --btn:#2a2a33;
+  --btn2:#1f1f26;
+  --accent:#3cff7a;
+}
+
+*{ box-sizing:border-box; }
+html,body{ height:100%; margin:0; }
+
+body{
+  font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+  background:var(--bg);
+  color:var(--text);
+}
+
+/* =================================================
+   MOBILE FIRST LAYOUT
+   ================================================= */
+
+.app{
+  height:100%;
+  display:flex;
+  flex-direction:column;
+}
+
+/* -------- Viewer (top ~66%) -------- */
+.viewer{
+  position:relative;
+  flex: 2 1 66%;
+  min-height:0;
+  border-bottom:1px solid var(--line);
+}
+
+.view{
+  width:100%;
+  height:100%;
+}
+
+/* HUD */
+.hud{
+  position:absolute;
+  left:12px;
+  top:12px;
+  padding:10px 12px;
+  background:rgba(10,10,12,0.65);
+  border:1px solid rgba(255,255,255,0.08);
+  border-radius:12px;
+  backdrop-filter: blur(6px);
+}
+.hud-title{ font-weight:700; letter-spacing:.2px; }
+.hud-sub{ color:var(--muted); font-size:12px; margin-top:2px; }
+
+/* -------- Controls (bottom ~34%) -------- */
+.sidebar{
+  flex: 1 1 34%;
+  overflow:auto;
+  padding:12px;
+  background:#0d0d10;
+}
+
+/* Panels */
+.panel{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:12px;
+  margin-bottom:12px;
+}
+
+.panel-title{
+  font-weight:700;
+  margin-bottom:10px;
+}
+
+/* Forms */
+.form{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+
+.field{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.field span{
+  color:var(--muted);
+  font-size:12px;
+}
+
+input,select{
+  width:100%;
+  padding:10px;
+  background:var(--panel2);
+  border:1px solid var(--line);
+  border-radius:10px;
+  color:var(--text);
+  outline:none;
+}
+
+input:focus,select:focus{
+  border-color: rgba(60,255,122,0.35);
+}
+
+.row{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+
+.btn{
+  padding:10px 12px;
+  background:var(--btn);
+  border:1px solid var(--line);
+  border-radius:10px;
+  color:var(--text);
+  cursor:pointer;
+  font-weight:600;
+}
+.btn:hover{ background:#30303a; }
+
+.btn.secondary{
+  background:var(--btn2);
+}
+.btn.secondary:hover{ background:#2a2a33; }
+
+.btn.danger{
+  background:#2a1517;
+  border-color:#3a1f22;
+}
+.btn.danger:hover{ background:#351a1d; }
+
+/* Selected */
+.selected{
+  background:var(--panel2);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:10px;
+}
+.selected-name{ font-weight:700; }
+.selected-meta{
+  color:var(--muted);
+  font-size:12px;
+  margin-top:4px;
+}
+
+/* Legend */
+.legend{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.legend-row{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  color:var(--muted);
+}
+.swatch{
+  width:14px;
+  height:14px;
+  border-radius:4px;
+  border:1px solid rgba(255,255,255,0.12);
+}
+.s-gray{ background:#7a7a7a; }
+.s-green{ background:#3cff7a; }
+.s-yellow{ background:#ffd84d; }
+.s-orange{ background:#ff9b3c; }
+.s-red{ background:#ff3c3c; }
+
+/* Recs */
+.recs{
+  background:var(--panel2);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:10px;
+  min-height:54px;
+  color:var(--muted);
+}
+.recs .rec{
+  padding:8px 0;
+  border-top:1px solid rgba(255,255,255,0.06);
+}
+.recs .rec:first-child{ border-top:none; }
+
+/* Logs */
+.logs{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.log{
+  background:var(--panel2);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:10px;
+}
+.log-top{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+}
+.log-ex{ font-weight:700; }
+.log-date{
+  color:var(--muted);
+  font-size:12px;
+}
+.log-meta{
+  color:var(--muted);
+  font-size:12px;
+  margin-top:4px;
+}
+
+.muted{ color:var(--muted); }
+.footnote{
+  color:var(--muted);
+  font-size:12px;
+}
+
+/* =================================================
+   DESKTOP OVERRIDE (UNCHANGED BEHAVIOR)
+   ================================================= */
+@media (min-width: 900px){
+
+  .app{
+    display:grid;
+    grid-template-columns: 1fr 360px;
+  }
+
+  .viewer{
+    border-bottom:none;
+    border-right:1px solid var(--line);
+  }
+
+  .sidebar{
+    height:100%;
+    flex:none;
+  }
+}
+
+################################################################################
+# FILE: main.js
+################################################################################
+
+// main.js
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+import { getAllExercisesCached, getExerciseById } from "./lib/exercises.js";
+import { classifyMeshName } from "./lib/muscleMap.js";
+import { computeHeat } from "./lib/recovery.js";
+import { generateRecs } from "./lib/recs.js";
+
+/* ==============================
+   PHP API endpoints
+============================== */
+const API_LOGS_GET     = "./api/get_logs.php";
+const API_WORKOUT_LOG  = "./api/log_workout.php";
+const API_STATE_RESET  = "./api/state_reset.php";
+
+/* ----------------------------- DOM refs ----------------------------- */
+const mount = document.getElementById("view");
+if (!mount) throw new Error("Missing #view element");
+
+const logForm = document.getElementById("logForm");
+const dateInput = document.getElementById("dateInput");
+const exerciseSelect = document.getElementById("exerciseSelect");
+const setsInput = document.getElementById("setsInput");
+const repsInput = document.getElementById("repsInput");
+const loadInput = document.getElementById("loadInput");
+
+const selectedBox = document.getElementById("selectedBox");
+const recsBox = document.getElementById("recsBox");
+const recsBtn = document.getElementById("recsBtn");
+const resetBtn = document.getElementById("resetBtn");
+const logsBox = document.getElementById("logsBox");
+
+/* ----------------------------- State ----------------------------- */
+let state = {
+  logs: [],
+  muscle: {},     // derived from logs: { groupId: { load, lastTrained, lastPing } }
+  lastUpdate: Date.now(),
+};
+
+let exerciseWeightsById = {}; // { exerciseId: {gid: weight} }
+
+/* ----------------------------- API helpers ----------------------------- */
+async function apiJson(url, opts = {}) {
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...opts,
+    headers: {
+      ...(opts.headers || {}),
+      "Content-Type": "application/json",
+    },
+  });
+
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`API ${url} returned non-JSON:\n${text.slice(0, 500)}`);
+  }
+
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || `HTTP ${res.status} from ${url}`);
+  }
+  return data;
+}
+
+/* ----------------------------- Logs ----------------------------- */
+async function loadLogsServer() {
+  const data = await apiJson(API_LOGS_GET, { method: "GET" });
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+
+  state.logs = rows.map((r) => ({
+    id: String(r.id),
+    date: String(r.workout_date),
+    exerciseId: String(r.exercise_id),
+    exerciseName: String(r.exercise_name),
+    sets: Number(r.sets),
+    reps: Number(r.reps),
+    loadLbs: r.load_lbs === null || r.load_lbs === undefined ? null : Number(r.load_lbs),
+    stimulus: Number(r.stimulus),
+    createdAt: String(r.created_at || ""),
+    muscles: (() => {
+      const mj = r.muscles_json;
+      if (!mj) return null;
+      if (typeof mj === "object") return mj;
+      if (typeof mj === "string") {
+        try { return JSON.parse(mj); } catch { return null; }
+      }
+      return null;
+    })(),
+  }));
+
+  state.lastUpdate = Date.now();
+}
+
+/* ----------------------------- Derived muscle state from logs ----------------------------- */
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+function hours(ms) {
+  return ms / (1000 * 60 * 60);
+}
+function parseSqlDateTime(s) {
+  // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS"
+  if (!s) return null;
+  const iso = s.replace(" ", "T");
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function rebuildMuscleFromLogs(now = Date.now()) {
+  const muscle = {};
+  const halfLifeHrs = 36;
+
+  const ensure = (gid) => {
+    if (!muscle[gid]) muscle[gid] = { load: 0, lastTrained: 0, lastPing: 0 };
+    return muscle[gid];
+  };
+
+  for (const l of state.logs) {
+    const dt = parseSqlDateTime(l.createdAt);
+    if (!dt) continue;
+    const tMs = dt.getTime();
+
+    const ageMs = now - tMs;
+    const decay = Math.pow(0.5, hours(ageMs) / halfLifeHrs);
+
+    const wmap =
+      (l.muscles && typeof l.muscles === "object")
+        ? l.muscles
+        : (exerciseWeightsById[l.exerciseId] || null);
+
+    if (!wmap) continue;
+
+    const stim = Number(l.stimulus) || 0;
+    if (!(stim > 0)) continue;
+
+    for (const [gidRaw, wRaw] of Object.entries(wmap)) {
+      const gid = String(gidRaw || "").trim();
+      const w = Number(wRaw);
+      if (!gid || !Number.isFinite(w) || w <= 0) continue;
+
+      const m = ensure(gid);
+      const add = stim * w * decay;
+      if (!(add > 0)) continue;
+
+      m.load = clamp01(m.load + add);
+      m.lastTrained = Math.max(m.lastTrained, tMs);
+    }
+  }
+
+  state.muscle = muscle;
+  state.lastUpdate = now;
+}
+
+/* ----------------------------- Three.js setup ----------------------------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(mount.clientWidth, mount.clientHeight);
+renderer.setClearColor(0x0b0b0c, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+mount.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(
+  45,
+  mount.clientWidth / mount.clientHeight,
+  0.01,
+  5000
+);
+camera.position.set(0, 160, 380);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 120, 0);
+
+// lights
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x202020, 0.55));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(250, 450, 250);
+scene.add(dir);
+
+// grid
+const grid = new THREE.GridHelper(800, 40, 0x2a2a2a, 0x181818);
+grid.position.y = 0;
+scene.add(grid);
+
+/* ----------------------------- Model bookkeeping ----------------------------- */
+let currentModel = null;
+const skinShellMeshes = [];
+const gymMeshes = [];
+const pickables = [];
+let selectedMesh = null;
+
+/* ----------------------------- Materials ----------------------------- */
+function makeBaselineMuscleMaterial() {
+  return new THREE.MeshStandardMaterial({
+    color: 0x7a7a7a,
+    roughness: 0.88,
+    metalness: 0.0,
+    emissive: new THREE.Color(0x000000),
+    emissiveIntensity: 0.0,
+  });
+}
+
+function makeSkinMaterial() {
+  return new THREE.MeshStandardMaterial({
+    color: 0x8e8e94,
+    roughness: 0.95,
+    metalness: 0.0,
+    transparent: true,
+    opacity: 0.32,
+    emissive: new THREE.Color(0x000000),
+    emissiveIntensity: 0.0,
+    depthWrite: false,
+  });
+}
+
+function applySelectionLook(mesh) {
+  if (!mesh?.material) return;
+  mesh.material.emissive = new THREE.Color(0x18a944);
+  mesh.material.emissiveIntensity = 1.15;
+  mesh.material.color = new THREE.Color(0x3cff7a);
+  mesh.material.wireframe = true;
+  mesh.material.needsUpdate = true;
+}
+
+function clearSelectionLook(mesh) {
+  if (!mesh?.material) return;
+  mesh.material.wireframe = false;
+  mesh.material.needsUpdate = true;
+}
+
+/* ----------------------------- Heat ----------------------------- */
+function heatToVisual(heat, overdo) {
+  const h = clamp01(heat);
+
+  let color = new THREE.Color(0x7a7a7a);
+  let emissive = new THREE.Color(0x000000);
+  let eI = 0.0;
+
+  if (overdo) {
+    color = new THREE.Color(0xff3c3c);
+    emissive = new THREE.Color(0xff3c3c);
+    eI = 1.25;
+    return { color, emissive, emissiveIntensity: eI };
+  }
+
+  if (h < 0.12) return { color, emissive, emissiveIntensity: eI };
+
+  if (h < 0.35) emissive = new THREE.Color(0x3cff7a);
+  else if (h < 0.6) emissive = new THREE.Color(0xffd84d);
+  else emissive = new THREE.Color(0xff9b3c);
+
+  return { color, emissive, emissiveIntensity: 0.8 };
+}
+
+/* ----------------------------- Loading model ----------------------------- */
+function frameObject(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+
+  controls.target.copy(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const dist = maxDim * 1.25;
+
+  camera.position.set(center.x, center.y + maxDim * 0.15, center.z + dist);
+  camera.near = Math.max(0.01, maxDim / 1000);
+  camera.far = maxDim * 20;
+  camera.updateProjectionMatrix();
+}
+
+function clearModel() {
+  if (currentModel) scene.remove(currentModel);
+  currentModel = null;
+  skinShellMeshes.length = 0;
+  gymMeshes.length = 0;
+  pickables.length = 0;
+  selectedMesh = null;
+}
+
+async function loadGLBWithFallback() {
+  const candidates = [
+    "./assets/models/body.glb",
+    "./assets/models/body.draco.glb",
+  ];
+
+  for (const url of candidates) {
+    try {
+      await loadGLB(url);
+      return;
+    } catch (e) {
+      console.warn("[GLB] failed:", url, e?.message || e);
+    }
+  }
+
+  throw new Error("Could not load any model. Put body.glb in assets/models/.");
+}
+
+function loadGLB(url) {
+  clearModel();
+  const loader = new GLTFLoader();
+
+  return new Promise((resolve, reject) => {
+    loader.load(
+      url,
+      (gltf) => {
+        const model = gltf.scene;
+        currentModel = model;
+
+        model.scale.setScalar(1);
+        model.position.set(0, 0, 0);
+
+        applyClassification(model);
+        scene.add(model);
+        frameObject(model);
+
+        applyHeatToAllMeshes();
+        resolve();
+      },
+      undefined,
+      (err) => reject(err)
+    );
+  });
+}
+
+function applyClassification(root) {
+  const skinMat = makeSkinMaterial();
+
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+
+    const info = classifyMeshName(obj.name);
+
+    if (info.kind === "shell") {
+      obj.material = skinMat;
+      obj.renderOrder = 2;
+      obj.frustumCulled = true;
+      obj.visible = true;
+      skinShellMeshes.push(obj);
+      return;
+    }
+
+    if (info.kind === "gym") {
+      obj.visible = true;
+      obj.renderOrder = 1;
+      obj.frustumCulled = true;
+
+      const base = makeBaselineMuscleMaterial();
+      obj.material = base;
+      obj.userData._muscle = {
+        groups: info.groups || [],
+        baseMaterial: base,
+      };
+
+      gymMeshes.push({ mesh: obj, groups: obj.userData._muscle.groups });
+      pickables.push(obj);
+      return;
+    }
+
+    obj.visible = false;
+  });
+}
+
+/* ----------------------------- Picking ----------------------------- */
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let downAt = null;
+
+function getPointerNDC(ev) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.set(
+    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+    -(((ev.clientY - rect.top) / rect.height) * 2 - 1)
+  );
+}
+
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+  downAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
+});
+
+renderer.domElement.addEventListener("pointerup", (ev) => {
+  if (!downAt) return;
+  const dx = Math.abs(ev.clientX - downAt.x);
+  const dy = Math.abs(ev.clientY - downAt.y);
+  const dt = performance.now() - downAt.t;
+  downAt = null;
+  if (dx > 6 || dy > 6 || dt > 500) return;
+
+  getPointerNDC(ev);
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(pickables, true);
+  if (!hits.length) return clearSelected();
+  setSelected(hits[0].object);
+});
+
+/* ----------------------------- Selection ----------------------------- */
+function prettyGroupId(id) {
+  return (id || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function setSelected(mesh) {
+  if (selectedMesh === mesh) return clearSelected();
+  clearSelected();
+  selectedMesh = mesh;
+
+  applyHeatToMesh(mesh);
+  applySelectionLook(mesh);
+
+  const groups = mesh.userData?._muscle?.groups || [];
+  selectedBox.querySelector(".selected-name").textContent = mesh.name || "(unnamed)";
+  selectedBox.querySelector(".selected-meta").textContent =
+    groups.length ? groups.map(prettyGroupId).join(", ") : "Unknown";
+}
+
+function clearSelected() {
+  if (!selectedMesh) return;
+  clearSelectionLook(selectedMesh);
+  applyHeatToMesh(selectedMesh);
+  selectedMesh = null;
+  selectedBox.querySelector(".selected-name").textContent = "None";
+  selectedBox.querySelector(".selected-meta").textContent = "Click a muscle.";
+}
+
+/* ----------------------------- Heat apply ----------------------------- */
+function applyHeatToMesh(mesh, now = Date.now()) {
+  const groups = mesh.userData?._muscle?.groups || [];
+  let maxHeat = 0;
+  let overdo = false;
+
+  for (const g of groups) {
+    const h = computeHeat(state, g, now);
+    maxHeat = Math.max(maxHeat, h.heat);
+    if (h.overdo) overdo = true;
+  }
+
+  const v = heatToVisual(maxHeat, overdo);
+  mesh.material.color = v.color;
+  mesh.material.emissive = v.emissive;
+  mesh.material.emissiveIntensity = v.emissiveIntensity;
+  mesh.material.wireframe = false;
+}
+
+function applyHeatToAllMeshes(now = Date.now()) {
+  for (const { mesh } of gymMeshes) applyHeatToMesh(mesh, now);
+  if (selectedMesh) applySelectionLook(selectedMesh);
+}
+
+/* ----------------------------- Recs ----------------------------- */
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
+
+function renderRecs() {
+  if (!recsBox) return;
+
+  const groupSet = new Set();
+  for (const { groups } of gymMeshes) for (const g of groups) groupSet.add(g);
+
+  const recs = generateRecs(state, [...groupSet], Date.now());
+  recsBox.innerHTML = recs.length
+    ? recs.map((r) => `<div class="rec">${escapeHtml(r.text)}</div>`).join("")
+    : `<div class="muted">Looking balanced. Keep it up.</div>`;
+}
+
+/* ----------------------------- Logs UI ----------------------------- */
+function renderLogs() {
+  const out = state.logs.slice(0, 20).map((l) => `
+    <div class="log">
+      <div class="log-top">
+        <div class="log-ex">${escapeHtml(l.exerciseName)}</div>
+        <div class="log-date">${escapeHtml(l.date)}</div>
+      </div>
+      <div class="log-meta">${l.sets}×${l.reps}${(l.loadLbs ?? null) !== null ? ` • ${escapeHtml(l.loadLbs)} lbs` : ""}</div>
+    </div>
+  `).join("");
+
+  logsBox.innerHTML = out || `<div class="muted">No logs yet.</div>`;
+}
+
+/* ----------------------------- Workout logging ----------------------------- */
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+async function renderExerciseOptions() {
+  exerciseSelect.innerHTML = "";
+
+  const list = await getAllExercisesCached();
+
+  // build a fast lookup for fallback (older logs without muscles_json)
+  exerciseWeightsById = {};
+  for (const ex of list) {
+    exerciseWeightsById[ex.id] = ex.w || {};
+  }
+
+  for (const ex of list) {
+    const opt = document.createElement("option");
+    opt.value = ex.id;
+    opt.textContent = ex.name;
+    exerciseSelect.appendChild(opt);
+  }
+}
+
+function computeStimulus(sets, reps, loadLbs) {
+  const vol = Math.max(1, sets * reps);
+
+  let loadFactor = 1.0;
+  if (Number.isFinite(loadLbs) && loadLbs > 0) {
+    loadFactor = 1.0 + Math.min(1.0, loadLbs / 200);
+  }
+
+  const base = (vol / 60) * loadFactor;
+  return clamp01(base);
+}
+
+async function onLogWorkout(ev) {
+  ev.preventDefault();
+
+  const date = (dateInput?.value || todayISO()).trim();
+  const exId = exerciseSelect.value;
+  const ex = await getExerciseById(exId);
+  if (!ex) return;
+
+  const sets = Math.max(1, parseInt(setsInput.value || "1", 10));
+  const reps = Math.max(1, parseInt(repsInput.value || "1", 10));
+  const loadLbsRaw = loadInput.value.trim();
+  const loadLbs = loadLbsRaw === "" ? null : Math.max(0, parseFloat(loadLbsRaw));
+
+  const stim = computeStimulus(sets, reps, loadLbs);
+
+  // snapshot muscles map
+  const muscles = {};
+  for (const [gid, w] of Object.entries(ex.w || {})) {
+    if (!Number.isFinite(w)) continue;
+    muscles[gid] = w;
+  }
+
+  await apiJson(API_WORKOUT_LOG, {
+    method: "POST",
+    body: JSON.stringify({
+      date,
+      exercise_id: ex.id,
+      exercise_name: ex.name,
+      sets,
+      reps,
+      load_lbs: loadLbs,
+      stimulus: stim,
+      muscles
+    }),
+  });
+
+  await loadLogsServer();
+  rebuildMuscleFromLogs(Date.now());
+
+  renderLogs();
+  renderRecs();
+  applyHeatToAllMeshes();
+
+  if (dateInput && !dateInput.value) dateInput.value = todayISO();
+}
+
+async function resetStateServer() {
+  try {
+    const res = await fetch(API_STATE_RESET, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }
+    });
+
+    const text = await res.text();
+    const json = JSON.parse(text);
+
+    return json && json.ok === true;
+  } catch (e) {
+    console.warn("[reset] failed:", e);
+    return false;
+  }
+}
+
+function makeDefaultState() {
+  return {
+    logs: [],
+    muscle: {},
+    lastUpdate: Date.now(),
+  };
+}
+
+/* ----------------------------- UI wiring ----------------------------- */
+if (logForm) logForm.addEventListener("submit", onLogWorkout);
+
+if (recsBtn) {
+  recsBtn.addEventListener("click", async () => {
+    rebuildMuscleFromLogs(Date.now());
+    renderRecs();
+    applyHeatToAllMeshes();
+  });
+}
+
+if (resetBtn) {
+  resetBtn.addEventListener("click", async () => {
+    if (!confirm("Reset ALL MuscleMap data? This wipes the shared database.")) return;
+
+    const ok = await resetStateServer();
+    if (!ok) {
+      alert("Reset failed. Check server logs.");
+      return;
+    }
+
+    state = makeDefaultState();
+
+    clearSelected();
+    renderLogs();
+    renderRecs();
+    applyHeatToAllMeshes();
+
+    alert("All data reset.");
+  });
+}
+
+/* ----------------------------- Resize ----------------------------- */
+window.addEventListener("resize", () => {
+  renderer.setSize(mount.clientWidth, mount.clientHeight);
+  camera.aspect = mount.clientWidth / mount.clientHeight;
+  camera.updateProjectionMatrix();
+});
+
+/* ----------------------------- Boot ----------------------------- */
+async function boot() {
+  await loadLogsServer();
+  await renderExerciseOptions();
+
+  if (dateInput) dateInput.value = todayISO();
+
+  rebuildMuscleFromLogs(Date.now());
+  renderLogs();
+  renderRecs();
+
+  loadGLBWithFallback().catch((e) => {
+    console.error(e);
+    alert("Model load failed.");
+  });
+}
+
+boot();
+
+/* ----------------------------- Loop ----------------------------- */
+let lastRebuildAt = Date.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const now = Date.now();
+  if (now - lastRebuildAt > 2000) {
+    lastRebuildAt = now;
+    rebuildMuscleFromLogs(now);
+    applyHeatToAllMeshes(now);
+    renderRecs();
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+################################################################################
+# FILE: lib/exercises.js
+################################################################################
+
+// lib/exercises.js
+const API_LIST = "./api/exercises_list.php";
+
+let _cache = null;
+let _cacheAt = 0;
+const TTL = 60_000;
+
+async function fetchList(){
+  const res = await fetch(API_LIST, { credentials:"same-origin", cache:"no-store" });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data?.exercises) ? data.exercises : [];
+}
+
+export async function getAllExercisesCached(){
+  const now = Date.now();
+  if (_cache && (now - _cacheAt) < TTL) return _cache;
+  _cache = await fetchList();
+  _cacheAt = now;
+  return _cache;
+}
+
+export async function getExerciseById(id){
+  const list = await getAllExercisesCached();
+  return list.find(e => e.id === id) || null;
+}
+
+export function bustExercisesCache(){
+  _cache = null;
+  _cacheAt = 0;
+}
+
+################################################################################
+# FILE: lib/recovery.js
+################################################################################
+
+// Recovery + heat algorithm.
+// We track “load” per muscle group and decay it over time.
+// recovery.js
+
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+function hours(ms){ return ms / (1000*60*60); }
+
+export function ensureMuscle(state, id){
+  if (!state.muscle[id]){
+    state.muscle[id] = {
+      load: 0,                // 0..1, increases with training, decays with time
+      lastTrained: 0,         // ms
+      lastPing: 0,            // ms
+    };
+  }
+  return state.muscle[id];
+}
+
+// Decay load over time since lastUpdate
+export function tickDecay(state, now=Date.now()){
+  const dt = now - (state.lastUpdate || now);
+  state.lastUpdate = now;
+
+  // half-life ~ 36 hours (tweak)
+  const halfLifeHrs = 36;
+  const decay = Math.pow(0.5, hours(dt) / halfLifeHrs);
+
+  for (const id of Object.keys(state.muscle)){
+    const m = state.muscle[id];
+    m.load = clamp01(m.load * decay);
+  }
+}
+
+// Apply a workout stimulus to a muscle group.
+// stimulus is 0..1-ish
+export function applyStimulus(state, id, stimulus, now=Date.now()){
+  const m = ensureMuscle(state, id);
+  m.load = clamp01(m.load + stimulus);
+  m.lastTrained = now;
+}
+
+// Convert load + recency into a display “heat” (0..1) and a “risk” signal.
+export function computeHeat(state, id, now=Date.now()){
+  const m = ensureMuscle(state, id);
+
+  const since = m.lastTrained ? (now - m.lastTrained) : Infinity;
+  const sinceH = hours(since);
+
+  // Recent training gets an immediate green bump even at low load
+  const freshness = sinceH < 18 ? (1 - sinceH/18) : 0; // 1..0
+
+  // heat is mostly load, with a small freshness bump
+  const heat = clamp01(m.load + 0.25 * freshness);
+
+  // overtraining signal: high load + too-recent repeat
+  const overdo = (m.load > 0.80 && sinceH < 24) || (m.load > 0.92);
+
+  return { heat, overdo, lastTrained: m.lastTrained, load: m.load };
+}
+
+// Neglect detection (for “hey champ hit lats”)
+export function isNeglected(state, id, now=Date.now()){
+  const m = ensureMuscle(state, id);
+
+  // if never trained, it’s neglected but don’t spam
+  if (!m.lastTrained) return true;
+
+  // > 8 days since last trained -> neglected
+  const days = (now - m.lastTrained) / (1000*60*60*24);
+  return days >= 8;
+}
+
+################################################################################
+# FILE: lib/muscleMap.js
+################################################################################
+
+// Map GLB mesh names -> fitness groups.
+// Z-Anatomy naming varies, so we use substring tokens.
+// muscleMap.js
+
+function hasAny(s, arr){ return arr.some(t => s.includes(t)); }
+
+export const GROUPS = [
+  // core regions (simulation)
+  { id:"abs_upper", label:"Abs (upper)", tokens:["rectus_abdominis"] , kind:"region" },
+  { id:"abs_lower", label:"Abs (lower)", tokens:["rectus_abdominis"] , kind:"region" },
+  { id:"obliques_external", label:"Obliques (external)", tokens:["external_abdominal_oblique"] },
+  { id:"obliques_internal", label:"Obliques (internal)", tokens:["internal_abdominal_oblique"] },
+  { id:"core_deep", label:"Deep core (TVA)", tokens:["transversus_abdominis"] },
+
+  // big groups
+  { id:"chest", label:"Chest", tokens:["pectoralis_major","pectoralis_minor"] },
+  { id:"lats", label:"Lats", tokens:["latissimus_dorsi"] },
+  { id:"upper_back", label:"Upper back", tokens:["trapezius","rhomboid","teres_major","teres_minor","infraspinatus","supraspinatus"] },
+  { id:"mid_back", label:"Mid back", tokens:["serratus_posterior","erector_spinae"] },
+  { id:"lower_back", label:"Lower back", tokens:["multifidus_thoracis","multifidus_lumborum","quadratus_lumborum"] },
+
+  { id:"shoulders", label:"Shoulders", tokens:["deltoid"] },
+  { id:"front_delts", label:"Front delts", tokens:["deltoid"] },
+  { id:"side_delts", label:"Side delts", tokens:["deltoid"] },
+  { id:"rear_delts", label:"Rear delts", tokens:["deltoid"] },
+
+  { id:"biceps", label:"Biceps", tokens:["biceps_brachii","brachialis"] },
+  { id:"triceps", label:"Triceps", tokens:["triceps_brachii"] },
+  { id:"forearms", label:"Forearms", tokens:["brachioradialis","flexor_carpi","extensor_carpi"] },
+
+  { id:"quads", label:"Quads", tokens:["rectus_femoris","vastus_lateralis","vastus_medialis","vastus_intermedius"] },
+  { id:"hamstrings", label:"Hamstrings", tokens:["biceps_femoris","semitendinosus","semimembranosus"] },
+  { id:"glutes", label:"Glutes", tokens:["gluteus_maximus","gluteus_medius","gluteus_minimus"] },
+  { id:"calves", label:"Calves", tokens:["gastrocnemius","soleus"] },
+
+  { id:"upper_traps", label:"Upper traps", tokens:["trapezius"] },
+  { id:"posterior_chain", label:"Posterior chain", tokens:["erector_spinae","gluteus","hamstring"] },
+
+  { id:"core", label:"Core", tokens:["rectus_abdominis","external_abdominal_oblique","internal_abdominal_oblique","transversus_abdominis"] },
+];
+
+// things we never want clickable / visible as “gym muscles”
+const MICRO_REJECT = [
+  // face / neck / tiny
+  "orbicularis","nasalis","frontalis","buccinator","masseter","temporalis",
+  "platysma","digastric","mylohyoid","geniohyoid","sternohyoid","omohyoid",
+  "thyrohyoid","crico","aryten","laryn","pharyn","tongue","hyoid",
+  // hands/feet micro
+  "interosse","lumbrical","thenar","hypothenar","palmaris_brevis",
+  "abductor_digiti","opponens","flexor_pollicis","extensor_pollicis",
+  "retinaculum","tarsal","plantar",
+];
+
+// shell identifiers
+const SHELL_TOKENS = ["superficial","skin","fascia","fasciar"];
+
+// A mesh is “gym-relevant” if:
+// - name contains _muscle / _muscler
+// - not micro reject
+// - matches at least one group token OR is a big/common muscle token
+const BIG_MUSCLE_FALLBACK = [
+  "pectoralis","deltoid","biceps","triceps",
+  "latissimus","trapezius","rhomboid",
+  "rectus_abdominis","oblique","gluteus",
+  "vastus","rectus_femoris",
+  "gastrocnemius","soleus",
+  "biceps_femoris","semitendinosus","semimembranosus",
+  "erector_spinae","quadratus_lumborum",
+];
+
+export function classifyMeshName(name){
+  const n = (name || "").toLowerCase();
+
+  // TEMP: hide this specific mesh entirely
+ // Permanently hide obliques (visual noise; rectus is the trained muscle)
+if (
+  n.includes("external_abdominal_oblique") ||
+  n.includes("internal_abdominal_oblique")
+) {
+  return { kind: "ignore" };
+}
+
+
+  const isShell = hasAny(n, SHELL_TOKENS) && !n.includes("_muscle") && !n.includes("_muscler");
+  const isMuscle = n.includes("_muscle") || n.includes("_muscler");
+
+  if (isShell) return { kind:"shell" };
+
+  if (!isMuscle) return { kind:"ignore" };
+
+  if (hasAny(n, MICRO_REJECT)) return { kind:"ignore" };
+
+  // match groups
+  const matched = [];
+  for (const g of GROUPS){
+    if (hasAny(n, g.tokens)) matched.push(g.id);
+  }
+
+  if (matched.length) return { kind:"gym", groups: matched };
+
+  // fallback for big muscles if names differ slightly
+  if (hasAny(n, BIG_MUSCLE_FALLBACK)) return { kind:"gym", groups: ["core"] };
+
+  return { kind:"ignore" };
+}
+
+################################################################################
+# FILE: lib/recs.js
+################################################################################
+
+//recs.js
+import { isNeglected, computeHeat } from "./recovery.js";
+
+export function generateRecs(state, groupIds, now=Date.now()){
+  const items = [];
+ 
+  for (const id of groupIds){
+    const { heat, overdo } = computeHeat(state, id, now);
+    const neglected = isNeglected(state, id, now);
+
+    if (overdo){
+      items.push({ type:"warn", id, text:`${id}: chill — recovery needed (you’re stacking volume too fast).` });
+      continue;
+    }
+
+    if (neglected){
+      items.push({ type:"nudge", id, text:`${id}: neglected. Add 2–4 sets this week.` });
+      continue;
+    }
+
+    if (heat < 0.18){
+      items.push({ type:"balance", id, text:`${id}: light. Consider adding a little volume.` });
+    }
+  }
+
+  // prioritize warnings and neglected
+  const score = (it) => it.type === "warn" ? 0 : it.type === "nudge" ? 1 : 2;
+  items.sort((a,b)=>score(a)-score(b));
+
+  return items.slice(0, 6);
+}
+
+
+=== END OF SNAPSHOT ===
