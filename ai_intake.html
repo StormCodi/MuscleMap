@@ -1,175 +1,60 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI Exercise Intake</title>
-  <style>
-    body{font-family:system-ui;margin:0;background:#0b0b0c;color:#eee}
-    .wrap{max-width:760px;margin:0 auto;padding:12px;display:flex;flex-direction:column;gap:10px}
-    .card{background:#141416;border:1px solid #25252a;border-radius:14px;padding:12px}
-    .row{display:flex;gap:8px;flex-wrap:wrap}
-    button{background:#2a7cff;border:0;color:white;padding:10px 12px;border-radius:10px;font-weight:700}
-    button.secondary{background:#2a2a31}
-    button:disabled{opacity:.5}
-    input,textarea{width:100%;background:#0f0f12;color:#eee;border:1px solid #2a2a31;border-radius:10px;padding:10px}
-    .chat{display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow:auto}
-    .bubble{padding:10px;border-radius:12px;line-height:1.25}
-    .u{background:#1f2a3a;align-self:flex-end}
-    .a{background:#1b1b1f;align-self:flex-start;border:1px solid #2a2a31}
-    .muted{opacity:.75;font-size:.9rem}
-    pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
-    .pill{display:inline-block;padding:2px 8px;border:1px solid #2a2a31;border-radius:999px;font-size:.85rem;opacity:.9}
-  </style>
+  <title>MuscleMap • AI Intake</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css" />
 </head>
+
 <body>
-  <div class="wrap">
-    <div class="card">
-      <div class="row">
-        <input id="img" type="file" accept="image/*" capture="environment">
-        <button id="start">New session</button>
+  <div class="app">
+    <aside class="sidebar" style="width: min(540px, 100%);">
+      <div class="panel">
+        <div class="panel-title">AI Exercise Intake</div>
+
+        <div class="muted" style="margin-bottom:10px;">
+          Take a photo (optional) and/or describe the exercise. AI will return JSON and add it if missing.
+        </div>
+
+        <form id="aiForm" class="form">
+          <label class="field">
+            <span>Photo (optional)</span>
+            <input id="imageInput" type="file" accept="image/*" capture="environment" />
+          </label>
+
+          <label class="field">
+            <span>Description</span>
+            <textarea id="textInput" rows="5" placeholder="Example: Cable triceps extensions, 3x12, elbows tucked..."></textarea>
+          </label>
+
+          <div class="row">
+            <button id="submitBtn" class="btn" type="submit">Analyze</button>
+            <a class="btn secondary" href="./index.html">Back</a>
+          </div>
+        </form>
       </div>
 
-      <textarea id="txt" placeholder='Describe the exercise (optional). Example: "Triceps cable extension"'></textarea>
-
-      <div class="row">
-        <button id="send">Send to Grok</button>
-        <button id="approve" disabled>Approve</button>
-        <button id="clear" class="secondary">Clear</button>
+      <div class="panel">
+        <div class="panel-title">Allowed muscle groups</div>
+        <div id="groupsBox" class="logs"></div>
       </div>
 
-      <div class="muted" id="status">No session</div>
-    </div>
+      <div class="panel">
+        <div class="panel-title">Result</div>
+        <pre id="resultBox" style="white-space:pre-wrap; word-break:break-word; margin:0;"></pre>
+      </div>
+    </aside>
 
-    <div class="card">
-      <div class="chat" id="chat"></div>
+    <div class="viewer" style="display:flex; align-items:center; justify-content:center;">
+      <div class="hud">
+        <div class="hud-title">MuscleMap</div>
+        <div class="hud-sub">AI Intake</div>
+      </div>
     </div>
   </div>
 
-<script>
-let sessionId = null;
-let lastMMJ = null;
-
-const el = (id)=>document.getElementById(id);
-const chat = el("chat");
-const statusEl = el("status");
-const approveBtn = el("approve");
-
-function addBubble(cls, html){
-  const d = document.createElement("div");
-  d.className = "bubble " + cls;
-  d.innerHTML = html;
-  chat.appendChild(d);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
-}
-
-async function postJSON(url, obj){
-  const r = await fetch(url, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify(obj)
-  });
-  const t = await r.text();
-  let j;
-  try { j = JSON.parse(t); } catch { throw new Error("Non-JSON: " + t.slice(0,250)); }
-  if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
-  return j;
-}
-
-async function fileToDataUrl(file){
-  return new Promise((res, rej)=>{
-    const fr = new FileReader();
-    fr.onload = ()=>res(fr.result);
-    fr.onerror = rej;
-    fr.readAsDataURL(file);
-  });
-}
-
-function updateApproveUI(){
-  approveBtn.disabled = true;
-  approveBtn.textContent = "Approve";
-
-  if (!lastMMJ) return;
-
-  if (lastMMJ.action === "PROPOSE_NEW" && lastMMJ.proposal) {
-    approveBtn.disabled = false;
-    approveBtn.textContent = "Approve → Add New Exercise";
-  } else if (lastMMJ.action === "MATCH_EXISTING" && lastMMJ.match) {
-    approveBtn.disabled = false;
-    approveBtn.textContent = "Approve → Use Existing Exercise";
-  }
-}
-
-el("start").onclick = async ()=>{
-  const j = await postJSON("./api/ai_intake_start.php", {});
-  sessionId = j.session_id;
-  lastMMJ = null;
-  chat.innerHTML = "";
-  approveBtn.disabled = true;
-  statusEl.textContent = "Session #" + sessionId;
-  addBubble("a", "Session started. Send an image or a description.");
-};
-
-el("send").onclick = async ()=>{
-  if (!sessionId) return alert("Start a session first.");
-
-  const text = el("txt").value.trim();
-  const f = el("img").files[0];
-  let img = "";
-  if (f) img = await fileToDataUrl(f);
-
-  if (!text && !img) return alert("Add text or an image.");
-
-  if (text) addBubble("u", escapeHtml(text));
-
-  statusEl.textContent = "Sending…";
-  const j = await postJSON("./api/ai_intake_step.php", {
-    session_id: sessionId,
-    text,
-    image_data_url: img
-  });
-
-  lastMMJ = j.mmj;
-
-  const pill = `<span class="pill">${escapeHtml(lastMMJ.action || "")}</span>`;
-  addBubble("a",
-    `${pill} <div style="margin-top:6px">${escapeHtml(lastMMJ.message || "")}</div>` +
-    `<pre>${escapeHtml(JSON.stringify(lastMMJ, null, 2))}</pre>`
-  );
-
-  statusEl.textContent = "Got response: " + lastMMJ.action;
-  updateApproveUI();
-
-  // keep text box for follow-up answers; clear image after send
-  el("img").value = "";
-};
-
-approveBtn.onclick = async ()=>{
-  if (!sessionId || !lastMMJ) return;
-
-  statusEl.textContent = "Approving…";
-  const j = await postJSON("./api/ai_intake_resolve.php", { session_id: sessionId });
-
-  if (j.mode === "new") {
-    addBubble("a", `✅ Added new exercise: <b>${escapeHtml(j.exercise.name)}</b> (<code>${escapeHtml(j.exercise.id)}</code>)`);
-  } else if (j.mode === "match") {
-    addBubble("a", `✅ Using existing exercise: <b>${escapeHtml(j.exercise.name)}</b> (<code>${escapeHtml(j.exercise.id)}</code>)`);
-  } else {
-    addBubble("a", `✅ Done.`);
-  }
-
-  approveBtn.disabled = true;
-  statusEl.textContent = "Done.";
-};
-
-el("clear").onclick = ()=>{
-  el("txt").value = "";
-  el("img").value = "";
-};
-</script>
+  <script type="module" src="./ai_intake.js"></script>
 </body>
 </html>
