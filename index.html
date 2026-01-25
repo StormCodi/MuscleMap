@@ -1,5 +1,4 @@
 <!-- index.html -->
-
 <!doctype html>
 <html lang="en">
 <head>
@@ -9,7 +8,6 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./style.css" />
 
-  <!-- Import map for local Three.js (downloaded into ./vendor/three/) -->
   <script type="importmap">
   {
     "imports": {
@@ -26,54 +24,71 @@
       <div id="view" class="view"></div>
 
       <div class="hud">
-        <div class="hud-title">MuscleMap</div>
-        <div class="hud-sub">Click a muscle • Log a workout • Watch recovery colors</div>
+        <div class="hud-top">
+          <div class="hud-title">MuscleMap</div>
+          <a class="hud-link" href="./ai_chat.html">🤖 AI Exercise Builder</a>
+        </div>
+        <div class="hud-sub">Tap a muscle • Build a workout • Watch recovery colors</div>
+
+        <div class="hud-row">
+          <div class="seg" role="group" aria-label="Heat mode">
+            <button id="heatOverallBtn" class="seg-btn on" type="button">Overall heat</button>
+            <button id="heatWorkoutBtn" class="seg-btn" type="button" disabled>Workout heat</button>
+          </div>
+        </div>
       </div>
     </div>
 
     <aside class="sidebar">
+      <!-- Workout / Editor -->
       <div class="panel">
-        <div class="panel-title">Workout log</div>
+        <div class="panel-head">
+          <div class="panel-title" id="workTitle">Workout</div>
+          <div class="panel-actions">
+            <button id="startWorkoutBtn" class="btn" type="button">Start workout</button>
+            <button id="endWorkoutBtn" class="btn danger" type="button" disabled>End</button>
+          </div>
+        </div>
 
-        <form id="logForm" class="form">
-          <label class="field">
-            <span>Date</span>
-            <input id="dateInput" type="date" />
-          </label>
+        <div class="work-meta">
+          <div class="pill">
+            <span class="pill-k">Time</span>
+            <span class="pill-v" id="timerText">—</span>
+          </div>
+          <div class="pill">
+            <span class="pill-k">Status</span>
+            <span class="pill-v" id="statusText">No workout</span>
+          </div>
+        </div>
 
+        <div id="workControls" class="work-controls disabled">
           <label class="field">
             <span>Exercise</span>
             <select id="exerciseSelect"></select>
           </label>
+          <button id="addExerciseBtn" class="btn" type="button">Add exercise</button>
+        </div>
 
-          <div class="row">
-            <label class="field">
-              <span>Sets</span>
-              <input id="setsInput" type="number" min="1" max="50" value="3" />
-            </label>
-            <label class="field">
-              <span>Reps</span>
-              <input id="repsInput" type="number" min="1" max="200" value="10" />
-            </label>
-          </div>
+        <div id="workoutEditor" class="workout-editor">
+          <div class="muted">Start a workout to add exercises.</div>
+        </div>
 
-          <label class="field">
-            <span>Load (lbs) (optional)</span>
-            <input id="loadInput" type="number" min="0" step="1" placeholder="e.g. 25" />
-          </label>
-
-          <button class="btn" type="submit">Log workout</button>
-        </form>
+        <div id="editorFooter" class="editor-footer hidden">
+          <button id="discardEditBtn" class="btn secondary" type="button">Back</button>
+          <button id="saveEditBtn" class="btn" type="button">Save changes</button>
+        </div>
       </div>
 
+      <!-- Selected -->
       <div class="panel">
         <div class="panel-title">Selected</div>
         <div id="selectedBox" class="selected">
           <div class="selected-name">None</div>
-          <div class="selected-meta">Click a muscle.</div>
+          <div class="selected-meta">Tap a muscle.</div>
         </div>
       </div>
 
+      <!-- Legend -->
       <div class="panel">
         <div class="panel-title">Legend</div>
         <div class="legend">
@@ -85,6 +100,7 @@
         </div>
       </div>
 
+      <!-- Recommendations -->
       <div class="panel">
         <div class="panel-title">Recommendations</div>
         <div id="recsBox" class="recs">
@@ -92,13 +108,21 @@
         </div>
         <div class="row">
           <button id="recsBtn" class="btn secondary" type="button">Generate recs</button>
-          <button id="resetBtn" class="btn danger" type="button">Reset data</button>
+          <button id="resetBtn" class="btn danger" type="button">Reset (local)</button>
         </div>
       </div>
 
+      <!-- Workouts -->
       <div class="panel">
-        <div class="panel-title">Recent logs</div>
-        <div id="logsBox" class="logs"></div>
+        <div class="panel-head">
+          <div class="panel-title" id="historyTitle">Workouts</div>
+          <div class="panel-actions">
+            <button id="prevPageBtn" class="btn secondary" type="button">Prev</button>
+            <button id="nextPageBtn" class="btn secondary" type="button">Next</button>
+          </div>
+        </div>
+        <div id="historyBox" class="history"></div>
+        <div class="muted tiny" id="pageHint"></div>
       </div>
 
       <div class="panel footnote">
