@@ -1,8 +1,14 @@
 <?php
+
+
 // api/exercises_list.php
 declare(strict_types=1);
-require __DIR__ . "/db.php";
+require __DIR__ . "/db.php"; // ✅ always correct
 header("Content-Type: application/json; charset=utf-8");
+
+ini_set('display_errors', '1');
+error_reporting(E_ALL);
+
 
 try {
   $stmt = $pdo->prepare("
