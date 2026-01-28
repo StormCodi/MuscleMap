@@ -11,27 +11,30 @@ from pathlib import Path
 
 # Add/remove files here.
 FILES = [
-    "api/db.php",
-    "api/get_logs.php",
-    "api/log_workout.php",
-    "api/state_reset.php",
+    # core user identity
+    "api/db.php",              # replace GLOBAL_USER_ID=0 with session-based user_id
+
+    # auth (new)
+    "api/auth/login.php",
+    "api/auth/register.php",
+    "api/auth/logout.php",
+
+    # APIs that must respect user_id (already mostly do, but rely on db.php)
+    "api/exercises_list.php",
+    "api/add_exercises.php",
     "api/ai_chat.php",
-    "api/ai_upload.php",
-    "index.html",
-    "ai_chat.html",
-    "style.css",
-    "ai_chat.css",
-    "main.js",
-    "ai_chat.js",
-    "lib/api.js",
-    "lib/exercises.js",
-    "lib/heat_engine.js",
-    "lib/recovery.js",
-    "lib/muscleMap.js",
-    "lib/recs.js",
-    "lib/renderer3d.js",
-    "lib/workout_ui.js",
+    "api/muscle_sensitivity.php",
+
+    # workout system (user_id is centralized here)
+    "api/workout/_lib.php",
+
+    # frontend needs to react to auth state
+    "lib/api.js",              # handle 401 once, globally
+    "main.js",                 # redirect if unauth
+    "ai_chat.js",              # redirect + logout
 ]
+
+
 
 OUT_FILE = "nice_snapshot.md"
 

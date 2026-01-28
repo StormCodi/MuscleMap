@@ -20,6 +20,14 @@ const heatWorkoutBtn = document.getElementById("heatWorkoutBtn");
 
 const selectedBox = document.getElementById("selectedBox");
 
+// NEW: sensitivity UI refs (from index.html)
+const sensWrap = document.getElementById("sensWrap");
+const sensSlider = document.getElementById("sensSlider");
+const sensValue = document.getElementById("sensValue");
+const sensSaveBtn = document.getElementById("sensSaveBtn");
+const sensResetBtn = document.getElementById("sensResetBtn");
+const sensStatus = document.getElementById("sensStatus");
+
 const recsBox = document.getElementById("recsBox");
 const recsBtn = document.getElementById("recsBtn");
 const resetBtn = document.getElementById("resetBtn");
@@ -52,6 +60,11 @@ function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
 
+function clampSens(x) {
+  if (!Number.isFinite(x)) return 1.0;
+  return Math.max(0.05, Math.min(1.5, x));
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -68,7 +81,7 @@ function prettyGroupId(id) {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-// per-set stimulus formula (same as your old one, just isolated)
+// per-set stimulus formula
 function computeStimulusSingleSet(reps, loadLbs) {
   const vol = Math.max(1, reps);
   let loadFactor = 1.0;
@@ -91,16 +104,104 @@ const heat = createHeatEngine({
 });
 
 /* ==============================
+   Sensitivity system state
+============================== */
+let selectedGroups = [];
+
+function setSensStatus(msg) {
+  if (sensStatus) sensStatus.textContent = msg || "";
+}
+
+function setSensUIVisible(yes) {
+  if (!sensWrap) return;
+  sensWrap.classList.toggle("hidden", !yes);
+}
+
+function setSensUIValue(v) {
+  const val = clampSens(Number(v));
+  if (sensSlider) sensSlider.value = String(val);
+  if (sensValue) sensValue.textContent = `${val.toFixed(2)}×`;
+}
+
+async function loadSensitivityFromServer() {
+  // PHP returns: { ok:true, map:{ group_id: sensitivity, ... } }
+  const data = await apiJson(API.SENSITIVITY_GET, { method: "GET" });
+  const map = (data && data.map && typeof data.map === "object") ? data.map : {};
+  heat.setSensitivityMap(map);
+}
+
+async function saveSensitivityForSelected(v) {
+  const sens = clampSens(Number(v));
+  if (!selectedGroups.length) return;
+
+  setSensStatus("Saving...");
+  try {
+    // PHP accepts: { map: { "chest": 1.2, "biceps": 0.9 } }
+    const map = {};
+    for (const gid of selectedGroups) map[gid] = sens;
+
+    await apiJson(API.SENSITIVITY_SET, {
+      method: "POST",
+      body: JSON.stringify({ map }),
+    });
+
+    heat.setSensitivityForGroups(selectedGroups, sens);
+    await rebuildHeatAndPaint();
+    setSensStatus("Saved.");
+    setTimeout(() => setSensStatus(""), 900);
+  } catch (e) {
+    console.warn("[sens] save failed:", e);
+    setSensStatus("Save failed.");
+  }
+}
+
+
+async function resetSensitivityForSelected() {
+  if (!selectedGroups.length) return;
+
+  const sens = 1.0;
+  setSensUIValue(sens);
+  heat.setSensitivityForGroups(selectedGroups, sens);
+  renderer3d.applyHeatToAllMeshes(heat.getState(), Date.now());
+  setSensStatus("");
+
+  // optional: persist reset to DB
+  await saveSensitivityForSelected(sens);
+}
+
+
+/* ==============================
    Selected panel UI
 ============================== */
 function setSelectedPanel({ name, groups }) {
   if (!selectedBox) return;
+
   const nameEl = selectedBox.querySelector(".selected-name");
   const metaEl = selectedBox.querySelector(".selected-meta");
+
   if (nameEl) nameEl.textContent = name || "None";
-  if (metaEl) metaEl.textContent = (groups && groups.length)
-    ? groups.map(prettyGroupId).join(", ")
-    : "Tap a muscle.";
+  if (metaEl) {
+    metaEl.textContent = (groups && groups.length)
+      ? groups.map(prettyGroupId).join(", ")
+      : "Tap a muscle.";
+  }
+
+  selectedGroups = Array.isArray(groups) ? groups : [];
+
+  if (!selectedGroups.length) {
+    setSensUIVisible(false);
+    setSensStatus("");
+    return;
+  }
+
+  setSensUIVisible(true);
+
+  // Use first group as the displayed value (single-slider UI)
+  const map = heat.getSensitivityMap();
+  const gid = selectedGroups[0];
+  const v = clampSens(Number(map?.[gid] ?? 1.0));
+  setSensUIValue(v);
+  setSensStatus("");
 }
 
 /* ==============================
@@ -158,13 +259,11 @@ const workoutUI = createWorkoutUI({
     nextPageBtn,
     pageHint,
 
-    // allow workout_ui to read heat mode for button UI syncing
     getHeatMode: () => heat.getMode(),
   },
 
   apiJson,
   getExerciseById: async (id) => {
-    // lazy import use (keeps workout_ui small)
     const mod = await import("./lib/exercises.js");
     return mod.getExerciseById(id);
   },
@@ -175,7 +274,6 @@ const workoutUI = createWorkoutUI({
   },
 
   onHeatAvailabilityChanged: ({ canWorkoutHeat }) => {
-    // if workout heat is impossible, force overall mode
     if (!canWorkoutHeat && heat.getMode() === "workout") {
       setHeatMode("overall");
     }
@@ -206,9 +304,38 @@ function setHeatMode(mode) {
   rebuildHeatAndPaint().catch((e) => console.warn("[heat] rebuild failed:", e));
 }
 
-// Heat mode toggles
 if (heatOverallBtn) heatOverallBtn.addEventListener("click", () => setHeatMode("overall"));
 if (heatWorkoutBtn) heatWorkoutBtn.addEventListener("click", () => setHeatMode("workout"));
+
+/* ==============================
+   Sensitivity UI events
+============================== */
+if (sensSlider) {
+  sensSlider.addEventListener("input", async () => {
+    const v = clampSens(Number(sensSlider.value));
+    setSensUIValue(v);
+    setSensStatus("Previewing...");
+    heat.setSensitivityForGroups(selectedGroups, v);
+    renderer3d.applyHeatToAllMeshes(heat.getState(), Date.now());
+  });
+}
+
+if (sensSaveBtn) {
+  sensSaveBtn.addEventListener("click", async () => {
+    if (!selectedGroups.length) return;
+    const v = clampSens(Number(sensSlider?.value ?? 1.0));
+    await saveSensitivityForSelected(v);
+  });
+}
+
+if (sensResetBtn) {
+  sensResetBtn.addEventListener("click", () => {
+    resetSensitivityForSelected();
+    const v = clampSens(Number(sensSlider?.value ?? 1.0));
+    heat.setSensitivityForGroups(selectedGroups, v);
+    renderer3d.applyHeatToAllMeshes(heat.getState(), Date.now());
+  });
+}
 
 /* ==============================
    Recs button
@@ -239,12 +366,10 @@ if (resetBtn) {
       return;
     }
 
-    // clear local state
     heat.clearAllLocalState();
     renderer3d.clearSelected();
     setSelectedPanel({ name: "None", groups: [] });
 
-    // refresh workout UI (will show no workout)
     await workoutUI.boot().catch(() => {});
     setHeatMode("overall");
 
@@ -263,22 +388,27 @@ window.addEventListener("resize", () => {
    Boot
 ============================== */
 async function boot() {
-  // exercises list (for select + optional fallback weights)
+  // exercises list
   try {
     const list = await getAllExercisesCached();
-   const map = {}; // existing
-   for (const ex of list) {
-     map[ex.id] = ex.w || {};
-     const opt = document.createElement("option");
-     opt.value = ex.id;
-     opt.textContent = ex.name;
-     exerciseSelect.appendChild(opt);  // Add here
-   }
+    const map = {};
+    for (const ex of list) {
+      map[ex.id] = ex.w || {};
+      const opt = document.createElement("option");
+      opt.value = ex.id;
+      opt.textContent = ex.name;
+      exerciseSelect.appendChild(opt);
+    }
     heat.setExerciseWeightsById(map);
-
-    
   } catch (e) {
     console.warn("[boot] exercises load failed:", e);
+  }
+
+  // load sensitivity (DB-backed)
+  try {
+    await loadSensitivityFromServer();
+  } catch (e) {
+    console.warn("[boot] sensitivity load failed:", e);
   }
 
   await workoutUI.boot();
@@ -293,7 +423,6 @@ async function boot() {
 
   // model
   renderer3d.loadGLBWithFallback().then(() => {
-    // repaint after model loads
     const st = heat.getState();
     renderer3d.applyHeatToAllMeshes(st, Date.now());
   }).catch((e) => {
@@ -317,7 +446,7 @@ function animate() {
 
   workoutUI.tickTimer(now);
 
-  // periodically refresh heat visuals/recs (no network; uses current state.logs)
+  // periodically refresh heat visuals/recs (no network)
   if (now - lastHeatRebuildAt > 2000) {
     lastHeatRebuildAt = now;
     const st = heat.tick(now);
@@ -325,13 +454,12 @@ function animate() {
     renderRecsFromState(st, now);
   }
 
-  // poll status occasionally so autoclose / other-tab changes reflect
+  // poll status occasionally
   if (now - lastStatusPollAt > 15000) {
     lastStatusPollAt = now;
 
     workoutUI.refreshStatus()
       .then(() => {
-        // if active workout disappeared while not editing a past workout, refresh view
         if (!workoutUI.getViewingWorkoutId() && !workoutUI.getActiveWorkout() && heat.getMode() === "workout") {
           setHeatMode("overall");
         }

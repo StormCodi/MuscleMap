@@ -85,6 +85,31 @@
         <div id="selectedBox" class="selected">
           <div class="selected-name">None</div>
           <div class="selected-meta">Tap a muscle.</div>
+
+          <!-- NEW: sensitivity UI -->
+          <div id="sensWrap" class="sens-wrap hidden">
+            <div class="sens-row">
+              <div class="sens-label">Sensitivity</div>
+              <div class="sens-val" id="sensValue">1.00×</div>
+            </div>
+
+            <input
+              id="sensSlider"
+              class="sens-slider"
+              type="range"
+              min="0.05"
+              max="1.5"
+              step="0.05"
+              value="1.00"
+            />
+
+            <div class="row">
+              <button id="sensSaveBtn" class="btn" type="button">Save</button>
+              <button id="sensResetBtn" class="btn secondary" type="button">Reset</button>
+            </div>
+
+            <div id="sensStatus" class="sens-status"></div>
+          </div>
         </div>
       </div>
 
