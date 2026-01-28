@@ -2,11 +2,15 @@
 // api/ai_upload.php
 declare(strict_types=1);
 
+require __DIR__ . "/db.php";
 header("Content-Type: application/json; charset=utf-8");
+
+// Enforce login (account-based)
+$uid = require_user_id();
 
 function bad(string $msg, int $code = 400, array $extra = []): void {
   http_response_code($code);
-  echo json_encode(array_merge(["ok" => false, "error" => $msg], $extra), JSON_UNESCAPED_SLASHES);
+  echo json_encode(["ok" => false, "error" => $msg] + $extra, JSON_UNESCAPED_SLASHES);
   exit;
 }
 
@@ -41,16 +45,17 @@ if (!isset($allowed[$mime])) bad("bad_image_type", 415, ["mime" => $mime]);
 $token = bin2hex(random_bytes(16));
 $ext = $allowed[$mime];
 
-// store in web-served folder
-$baseDir = realpath(__DIR__ . "/.."); // /var/www/html/musclemap
+// project root (/var/www/html/musclemap)
+$baseDir = realpath(__DIR__ . "/..");
 if ($baseDir === false) bad("base_dir_fail", 500);
 
-$dir = $baseDir . "/uploads/ai_tmp";
+// PER-USER folder: /uploads/ai_tmp/u{uid}
+$dir = $baseDir . "/uploads/ai_tmp/u" . (int)$uid;
 if (!is_dir($dir)) {
   if (!@mkdir($dir, 0775, true)) bad("mkdir_fail", 500);
 }
 
-// basic cleanup: delete files older than 24h (best-effort)
+// best-effort cleanup: delete files older than 24h (per user folder)
 $ttl = 24 * 3600;
 foreach (glob($dir . "/*.*") ?: [] as $p) {
   $mt = @filemtime($p);
@@ -58,6 +63,7 @@ foreach (glob($dir . "/*.*") ?: [] as $p) {
 }
 
 $dst = $dir . "/" . $token . "." . $ext;
+
 if (!@move_uploaded_file($tmp, $dst)) {
   // fallback if move_uploaded_file fails (some configs)
   $bytes = @file_get_contents($tmp);
@@ -65,8 +71,10 @@ if (!@move_uploaded_file($tmp, $dst)) {
   if (@file_put_contents($dst, $bytes) === false) bad("write_fail", 500);
 }
 
+@chmod($dst, 0644);
+
 // Return a relative URL the frontend can display
-$url = "./uploads/ai_tmp/" . $token . "." . $ext;
+$url = "./uploads/ai_tmp/u" . (int)$uid . "/" . $token . "." . $ext;
 
 echo json_encode([
   "ok" => true,

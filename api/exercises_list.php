@@ -1,14 +1,12 @@
 <?php
-
-
 // api/exercises_list.php
 declare(strict_types=1);
-require __DIR__ . "/db.php"; // ✅ always correct
+
+require __DIR__ . "/db.php";
 header("Content-Type: application/json; charset=utf-8");
 
-ini_set('display_errors', '1');
-error_reporting(E_ALL);
-
+// Enforce login + define user context
+$uid = require_user_id();
 
 try {
   $stmt = $pdo->prepare("
@@ -17,17 +15,21 @@ try {
     WHERE user_id = :uid AND is_active = 1
     ORDER BY name ASC
   ");
-  $stmt->execute([":uid" => GLOBAL_USER_ID]);
+  $stmt->execute([":uid" => $uid]);
 
   $out = [];
-  foreach ($stmt->fetchAll() as $r) {
-    $w = json_decode((string)$r["weights_json"], true);
+  foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+    $w = json_decode((string)($r["weights_json"] ?? ""), true);
     if (!is_array($w)) $w = [];
-    $out[] = ["id" => (string)$r["id"], "name" => (string)$r["name"], "w" => $w];
+    $out[] = [
+      "id"   => (string)($r["id"] ?? ""),
+      "name" => (string)($r["name"] ?? ""),
+      "w"    => $w,
+    ];
   }
 
   echo json_encode(["ok" => true, "exercises" => $out], JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
   http_response_code(500);
-  echo json_encode(["ok" => false, "error" => "server_error"]);
+  echo json_encode(["ok" => false, "error" => "server_error"], JSON_UNESCAPED_SLASHES);
 }

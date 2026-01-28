@@ -2,71 +2,66 @@
 // api/muscle_sensitivity.php
 declare(strict_types=1);
 
+require __DIR__ . "/db.php";
+
+// Enforce login
+require_user_id();
+
 header("Content-Type: application/json; charset=utf-8");
 
-function json_ok(array $extra = []): void {
+// Avoid name collision with db.php's json_err()
+function mm_ok(array $extra = []): void {
   echo json_encode(["ok" => true] + $extra, JSON_UNESCAPED_SLASHES);
   exit;
 }
-function json_err(string $msg, int $code = 400): void {
+function mm_fail(string $msg, int $code = 400, array $extra = []): void {
   http_response_code($code);
-  echo json_encode(["ok" => false, "error" => $msg], JSON_UNESCAPED_SLASHES);
+  echo json_encode(["ok" => false, "error" => $msg] + $extra, JSON_UNESCAPED_SLASHES);
   exit;
 }
-function read_json_body(): array {
+function mm_read_json(): array {
   $raw = file_get_contents("php://input");
-  if ($raw === false || trim($raw) === "") return [];
+  if ($raw === false) mm_fail("bad_body", 400);
+  $raw = trim($raw);
+  if ($raw === "") return [];
   $data = json_decode($raw, true);
-  if (!is_array($data)) json_err("bad_json", 400);
+  if (!is_array($data)) mm_fail("bad_json", 400);
   return $data;
 }
-
-require_once __DIR__ . "/db.php";
-
-/**
- * Be defensive: your db.php might expose PDO differently.
- */
-function resolve_pdo(): PDO {
-  // common patterns
-  if (function_exists("db")) {
-    $pdo = db();
-    if ($pdo instanceof PDO) return $pdo;
-  }
-  if (function_exists("get_pdo")) {
-    $pdo = get_pdo();
-    if ($pdo instanceof PDO) return $pdo;
-  }
-  // $pdo in global scope
-  if (isset($GLOBALS["pdo"]) && $GLOBALS["pdo"] instanceof PDO) return $GLOBALS["pdo"];
-
-  json_err("db_unavailable", 500);
+function mm_is_finite(float $x): bool {
+  return is_finite($x);
+}
+function mm_clamp(float $x, float $lo, float $hi): float {
+  if ($x < $lo) return $lo;
+  if ($x > $hi) return $hi;
+  return $x;
+}
+function mm_valid_gid(string $gid): bool {
+  // keep it permissive but safe
+  // your real allowed set is enforced client-side by selection anyway
+  return (bool)preg_match('/^[a-z0-9_]{2,64}$/', $gid);
 }
 
-$USER_ID = defined("GLOBAL_USER_ID") ? (int)GLOBAL_USER_ID : 0;
-
-$pdo = resolve_pdo();
-$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-// create table if missing? (NO) -> keep explicit migration
-// main operations:
-
+$uid = (int)GLOBAL_USER_ID;
 $method = $_SERVER["REQUEST_METHOD"] ?? "GET";
 
 try {
   if ($method === "GET") {
-    $stmt = $pdo->prepare("SELECT group_id, sensitivity FROM muscle_sensitivity WHERE user_id = ?"); 
-    $stmt->execute([$USER_ID]);
+    $stmt = $pdo->prepare("SELECT group_id, sensitivity FROM muscle_sensitivity WHERE user_id = ?");
+    $stmt->execute([$uid]);
+
     $map = [];
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
       $gid = (string)($row["group_id"] ?? "");
       $val = (float)($row["sensitivity"] ?? 1.0);
       if ($gid !== "") $map[$gid] = $val;
     }
-    json_ok(["map" => $map]);
+
+    mm_ok(["map" => $map]);
   }
 
   if ($method === "POST") {
-    $body = read_json_body();
+    $body = mm_read_json();
 
     // accept either:
     // 1) { "group_id": "...", "sensitivity": 1.2 }
@@ -75,15 +70,14 @@ try {
 
     if (isset($body["map"]) && is_array($body["map"])) {
       foreach ($body["map"] as $gid => $val) {
-        $items[] = [ (string)$gid, $val ];
+        $items[] = [(string)$gid, $val];
       }
     } elseif (isset($body["group_id"])) {
-      $items[] = [ (string)$body["group_id"], $body["sensitivity"] ?? null ];
+      $items[] = [(string)$body["group_id"], $body["sensitivity"] ?? null];
     } else {
-      json_err("missing_group_id_or_map", 400);
+      mm_fail("missing_group_id_or_map", 400);
     }
 
-    // upsert each row
     $sql = "
       INSERT INTO muscle_sensitivity (user_id, group_id, sensitivity, updated_at)
       VALUES (?, ?, ?, NOW())
@@ -94,25 +88,28 @@ try {
     $stmt = $pdo->prepare($sql);
 
     $saved = 0;
-    foreach ($items as [$gidRaw, $valRaw]) {
-      $gid = trim((string)$gidRaw);
-      if ($gid === "") continue;
 
-      $v = (float)$valRaw;
-      if (!is_finite($v)) continue;
+    foreach ($items as $pair) {
+      $gid = trim((string)($pair[0] ?? ""));
+      if ($gid === "" || !mm_valid_gid($gid)) continue;
 
-      // clamp to sane range
-      if ($v < 0.05) $v = 0.05;
-      if ($v > 1.5) $v = 1.5;
+      $rawVal = $pair[1] ?? null;
+      if (!is_numeric($rawVal)) continue;
 
-      $stmt->execute([$USER_ID, $gid, $v]);
+      $v = (float)$rawVal;
+      if (!mm_is_finite($v)) continue;
+
+      // clamp to sane range (matches your UI)
+      $v = mm_clamp($v, 0.05, 1.5);
+
+      $stmt->execute([$uid, $gid, $v]);
       $saved++;
     }
 
-    json_ok(["saved" => $saved]);
+    mm_ok(["saved" => $saved]);
   }
 
-  json_err("method_not_allowed", 405);
+  mm_fail("method_not_allowed", 405);
 } catch (Throwable $e) {
-  json_err("server_error", 500);
+  mm_fail("server_error", 500);
 }

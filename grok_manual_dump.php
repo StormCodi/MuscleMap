@@ -94,7 +94,7 @@ if ($XAI_KEY === "") {
 /* =========================
    File selection rules
 ========================= */
-$allowedExt = ["php","js","html","css"];
+$allowedExt = ["php","js","html","css", "md", "error"];
 
 $excludeDirs = [
   ".git",

@@ -23,7 +23,7 @@ $load = array_key_exists("load_lbs", $data) ? nullable_float($data["load_lbs"]) 
 $stim = floatv($data["stimulus"], 0.0, 5.0);
 
 $muscles = $data["muscles"];
-if (!is_array($muscles)) json_err("muscles must be an object map");
+if (!is_array($muscles)) json_err("muscles must be an object map", 400);
 
 // sanitize muscles map: keep only finite positive weights
 $clean = [];
@@ -35,6 +35,7 @@ foreach ($muscles as $k => $v) {
   if (!is_finite($w) || $w <= 0) continue;
   $clean[$gid] = $w;
 }
+
 $musclesJson = json_encode($clean, JSON_UNESCAPED_SLASHES);
 if ($musclesJson === false) $musclesJson = null;
 

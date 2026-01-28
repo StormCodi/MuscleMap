@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MuscleMap • Login</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css" />
+  <style>
+    .auth-wrap{max-width:520px;margin:40px auto;padding:18px}
+    .auth-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px}
+    .auth-title{font-size:20px;font-weight:700;margin:0 0 6px}
+    .auth-sub{opacity:.75;margin:0 0 14px}
+    .tabs{display:flex;gap:8px;margin:10px 0 16px}
+    .tab{flex:1}
+    .tab button{width:100%}
+    .field{display:block;margin:10px 0}
+    .field span{display:block;font-size:12px;opacity:.8;margin:0 0 6px}
+    .field input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit}
+    .row{display:flex;gap:10px;align-items:center;margin-top:12px}
+    .grow{flex:1}
+    .status{margin-top:12px;font-size:13px;opacity:.85;min-height:18px}
+    .status.bad{color:#ff8a8a;opacity:1}
+    .status.good{color:#8affb0;opacity:1}
+    .tiny{font-size:12px;opacity:.65;margin-top:12px}
+  </style>
+</head>
+<body>
+  <div class="auth-wrap">
+    <div class="auth-card">
+      <h1 class="auth-title">MuscleMap</h1>
+      <p class="auth-sub">Sign in to continue.</p>
+
+      <div class="tabs">
+        <div class="tab"><button id="tabLogin" class="btn">Login</button></div>
+        <div class="tab"><button id="tabRegister" class="btn secondary">Register</button></div>
+      </div>
+
+      <!-- Login -->
+      <form id="loginForm" autocomplete="on">
+        <label class="field">
+          <span>Email</span>
+          <input id="loginEmail" type="email" autocomplete="email" required />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="loginPass" type="password" autocomplete="current-password" minlength="6" required />
+        </label>
+
+        <div class="row">
+          <button class="btn grow" type="submit">Login</button>
+          <button id="logoutBtn" class="btn secondary" type="button" title="If you’re stuck in a weird session">Logout</button>
+        </div>
+      </form>
+
+      <!-- Register -->
+      <form id="registerForm" class="hidden" autocomplete="on">
+        <label class="field">
+          <span>Email</span>
+          <input id="regEmail" type="email" autocomplete="email" required />
+        </label>
+        <label class="field">
+          <span>Password (min 6 chars)</span>
+          <input id="regPass" type="password" autocomplete="new-password" minlength="6" required />
+        </label>
+
+        <div class="row">
+          <button class="btn grow" type="submit">Create account</button>
+        </div>
+
+        <div class="tiny">
+          This assumes your DB has a <code>users</code> table with unique <code>email</code>.
+        </div>
+      </form>
+
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_LOGIN = "./api/auth/login.php";
+    const API_REGISTER = "./api/auth/register.php";
+    const API_LOGOUT = "./api/auth/logout.php";
+
+    const tabLogin = document.getElementById("tabLogin");
+    const tabRegister = document.getElementById("tabRegister");
+
+    const loginForm = document.getElementById("loginForm");
+    const registerForm = document.getElementById("registerForm");
+
+    const loginEmail = document.getElementById("loginEmail");
+    const loginPass = document.getElementById("loginPass");
+
+    const regEmail = document.getElementById("regEmail");
+    const regPass = document.getElementById("regPass");
+
+    const logoutBtn = document.getElementById("logoutBtn");
+    const statusEl = document.getElementById("status");
+
+    function setStatus(msg, kind){
+      statusEl.textContent = msg || "";
+      statusEl.classList.remove("bad","good");
+      if (kind) statusEl.classList.add(kind);
+    }
+
+    function showLogin(){
+      loginForm.classList.remove("hidden");
+      registerForm.classList.add("hidden");
+      tabLogin.classList.remove("secondary");
+      tabRegister.classList.add("secondary");
+      setStatus("");
+    }
+
+    function showRegister(){
+      registerForm.classList.remove("hidden");
+      loginForm.classList.add("hidden");
+      tabRegister.classList.remove("secondary");
+      tabLogin.classList.add("secondary");
+      setStatus("");
+    }
+
+    tabLogin.addEventListener("click", (e) => { e.preventDefault(); showLogin(); });
+    tabRegister.addEventListener("click", (e) => { e.preventDefault(); showRegister(); });
+
+    async function postJson(url, body){
+      const res = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {})
+      });
+
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); }
+      catch { throw new Error(`Non-JSON:\n${text.slice(0, 400)}`); }
+
+      if (!res.ok || json?.ok === false){
+        const err = json?.error || `HTTP ${res.status}`;
+        const e = new Error(err);
+        e._code = res.status;
+        throw e;
+      }
+      return json;
+    }
+
+    loginForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setStatus("Logging in…");
+
+      try {
+        const email = (loginEmail.value || "").trim().toLowerCase();
+        const password = (loginPass.value || "");
+        await postJson(API_LOGIN, { email, password });
+
+        setStatus("Logged in. Redirecting…", "good");
+        window.location.assign("./index.html");
+      } catch (err) {
+        setStatus(String(err?.message || err), "bad");
+      }
+    });
+
+    registerForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setStatus("Creating account…");
+
+      try {
+        const email = (regEmail.value || "").trim().toLowerCase();
+        const password = (regPass.value || "");
+        await postJson(API_REGISTER, { email, password });
+
+        setStatus("Account created. Redirecting…", "good");
+        window.location.assign("./index.html");
+      } catch (err) {
+        const msg = String(err?.message || err);
+        setStatus(msg, "bad");
+      }
+    });
+
+    logoutBtn.addEventListener("click", async () => {
+      setStatus("Logging out…");
+      try {
+        const res = await fetch(API_LOGOUT, {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store"
+        });
+        // ignore body
+        setStatus("Logged out.", "good");
+      } catch {
+        setStatus("Logout failed (network).", "bad");
+      }
+    });
+
+    // default
+    showLogin();
+  </script>
+</body>
+</html>

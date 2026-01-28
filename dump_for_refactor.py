@@ -9,31 +9,9 @@ from pathlib import Path
 # CONFIG
 # =========================
 
-# Add/remove files here.
 FILES = [
-    # core user identity
-    "api/db.php",              # replace GLOBAL_USER_ID=0 with session-based user_id
-
-    # auth (new)
-    "api/auth/login.php",
-    "api/auth/register.php",
-    "api/auth/logout.php",
-
-    # APIs that must respect user_id (already mostly do, but rely on db.php)
-    "api/exercises_list.php",
-    "api/add_exercises.php",
-    "api/ai_chat.php",
-    "api/muscle_sensitivity.php",
-
-    # workout system (user_id is centralized here)
-    "api/workout/_lib.php",
-
-    # frontend needs to react to auth state
-    "lib/api.js",              # handle 401 once, globally
-    "main.js",                 # redirect if unauth
-    "ai_chat.js",              # redirect + logout
+    "api/db.php",
 ]
-
 
 
 OUT_FILE = "nice_snapshot.md"

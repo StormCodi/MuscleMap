@@ -1,9 +1,12 @@
 <?php
 // api/add_exercises.php
 declare(strict_types=1);
-header("Content-Type: application/json; charset=utf-8");
 
 require __DIR__ . "/db.php";
+header("Content-Type: application/json; charset=utf-8");
+
+// Enforce login + define user context
+$uid = require_user_id();
 
 function bad(string $msg, int $code = 400): void {
   http_response_code($code);
@@ -34,6 +37,8 @@ foreach ($w as $k => $v) {
   if (!is_numeric($v)) continue;
 
   $fv = (float)$v;
+  if (!is_finite($fv)) continue;
+
   if ($fv < 0.0) $fv = 0.0;
   if ($fv > 1.0) $fv = 1.0;
 
@@ -43,10 +48,10 @@ foreach ($w as $k => $v) {
 if (!$clean) bad("empty_weights");
 
 $weightsJson = json_encode($clean, JSON_UNESCAPED_SLASHES);
+if ($weightsJson === false) bad("json_fail", 500);
 
 try {
-  // Upsert by (user_id, exercise_key)
-  // NOTE: This assumes you have UNIQUE(user_id, exercise_key) on exercises.
+  // Assumes UNIQUE(user_id, exercise_key) on exercises.
   $stmt = $pdo->prepare("
     INSERT INTO exercises (user_id, exercise_key, name, weights_json, source, is_active)
     VALUES (:uid, :ek, :nm, CAST(:wj AS JSON), :src, 1)
@@ -59,7 +64,7 @@ try {
   ");
 
   $stmt->execute([
-    ":uid" => GLOBAL_USER_ID,
+    ":uid" => $uid,
     ":ek"  => $id,
     ":nm"  => $name,
     ":wj"  => $weightsJson,

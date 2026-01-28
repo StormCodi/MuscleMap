@@ -2,12 +2,15 @@
 // api/ai_chat.php
 declare(strict_types=1);
 
-header("Content-Type: application/json; charset=utf-8");
 require __DIR__ . "/db.php";
+header("Content-Type: application/json; charset=utf-8");
+
+// Enforce login + define user context
+$uid = require_user_id();
 
 function bad(string $msg, int $code = 400, array $extra = []): void {
   http_response_code($code);
-  echo json_encode(array_merge(["ok" => false, "error" => $msg], $extra), JSON_UNESCAPED_SLASHES);
+  echo json_encode(["ok" => false, "error" => $msg] + $extra, JSON_UNESCAPED_SLASHES);
   exit;
 }
 
@@ -77,8 +80,7 @@ function assistantTextFromContent($content): string {
 
 /* ─────────────────────────────
    Input: JSON body (preferred) OR fallback form payload
-   Your frontend sends JSON: { history, text, image_tokens }
-   NOTE: images are NOT required.
+   Frontend sends JSON: { history, text, image_tokens }
 ───────────────────────────── */
 $rawBody = file_get_contents("php://input");
 $payload = null;
@@ -87,7 +89,6 @@ if (is_string($rawBody) && trim($rawBody) !== "") {
   $payload = json_decode($rawBody, true);
   if (!is_array($payload)) bad("bad_json");
 } else {
-  // fallback (older)
   $payloadRaw = $_POST["payload"] ?? "";
   if (!is_string($payloadRaw) || $payloadRaw === "") bad("missing_payload");
   $payload = json_decode($payloadRaw, true);
@@ -104,7 +105,7 @@ if (!is_array($imageTokens)) $imageTokens = [];
 if ($text === "" && count($imageTokens) === 0) bad("missing_input");
 
 /* ─────────────────────────────
-   Load ALL exercises (name + weights)
+   Load ALL exercises (name + weights) for THIS user
 ───────────────────────────── */
 try {
   $stmt = $pdo->prepare("
@@ -113,19 +114,20 @@ try {
     WHERE user_id = :uid AND is_active = 1
     ORDER BY name ASC
   ");
-  $stmt->execute([":uid" => GLOBAL_USER_ID]);
+  $stmt->execute([":uid" => $uid]);
 
   $dbExercises = [];
   foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
-    $w = json_decode((string)$r["weights_json"], true);
+    $w = json_decode((string)($r["weights_json"] ?? ""), true);
     if (!is_array($w)) $w = [];
     $dbExercises[] = [
-      "id" => (string)$r["exercise_key"],
-      "name" => (string)$r["name"],
+      "id" => (string)($r["exercise_key"] ?? ""),
+      "name" => (string)($r["name"] ?? ""),
       "w" => weightsNormalize($w),
     ];
   }
   $exJson = json_encode($dbExercises, JSON_UNESCAPED_SLASHES);
+  if ($exJson === false) bad("json_fail", 500);
 } catch (Throwable $e) {
   bad("db_error", 500);
 }
@@ -146,43 +148,62 @@ $allowedSet = array_fill_keys($allowedIds, true);
 $allowedStr = implode(", ", $allowedIds);
 
 /* ─────────────────────────────
-   Resolve uploaded image tokens -> data URLs
-   Expects files stored by ai_upload.php in /uploads/ai_tmp/{token}.{ext}
-   Accepts jpg/png/webp.
+   Resolve uploaded image tokens -> data URLs (PER-USER)
+   Expects: /uploads/ai_tmp/u{uid}/{token}.{ext}
+   Also enforces a total byte budget to avoid huge base64 payloads.
 ───────────────────────────── */
 $baseDir = realpath(__DIR__ . "/.."); // /var/www/html/musclemap
 if ($baseDir === false) bad("base_dir_fail", 500);
 
-$imgDir = $baseDir . "/uploads/ai_tmp";
+$imgDir = $baseDir . "/uploads/ai_tmp/u" . (int)$uid;
 $imageDataUrls = [];
 
-$imageTokens = array_values(array_filter($imageTokens, fn($t) => is_string($t) && preg_match('/^[a-f0-9]{32}$/', $t)));
+$imageTokens = array_values(array_filter(
+  $imageTokens,
+  fn($t) => is_string($t) && preg_match('/^[a-f0-9]{32}$/', $t)
+));
 if (count($imageTokens) > 6) $imageTokens = array_slice($imageTokens, 0, 6);
 
 $exts = ["jpg","jpeg","png","webp"];
 $mimeMap = ["jpg"=>"image/jpeg","jpeg"=>"image/jpeg","png"=>"image/png","webp"=>"image/webp"];
 
+// total raw bytes budget (base64 expands ~33% so keep this conservative)
+$totalBudget = 9_000_000; // 9MB raw
+$totalUsed = 0;
+
 foreach ($imageTokens as $tok) {
+  if (!is_dir($imgDir)) break;
+
   $path = null;
   $extFound = null;
+
   foreach ($exts as $ext) {
     $p = $imgDir . "/" . $tok . "." . $ext;
     if (is_file($p)) { $path = $p; $extFound = $ext; break; }
   }
-  if ($path === null) continue; // token missing -> ignore (don’t hard fail)
+  if ($path === null) continue;
+
+  $sz = @filesize($path);
+  if ($sz === false || $sz <= 0) continue;
+
+  if ($totalUsed + $sz > $totalBudget) {
+    // stop adding more images once budget is exceeded
+    break;
+  }
 
   $bytes = @file_get_contents($path);
   if ($bytes === false || $bytes === "") continue;
 
   $mime = $mimeMap[$extFound] ?? (@mime_content_type($path) ?: "");
-  if ($mime === "" || !in_array($mime, ["image/jpeg","image/png","image/webp"], true)) continue;
+  if (!in_array($mime, ["image/jpeg","image/png","image/webp"], true)) continue;
 
   $b64 = base64_encode($bytes);
   $imageDataUrls[] = "data:$mime;base64,$b64";
+  $totalUsed += (int)$sz;
 }
 
 /* ─────────────────────────────
-   System prompt (supports multiple proposals)
+   System prompt
 ───────────────────────────── */
 $system = <<<SYS
 You are MuscleMap's chat intake assistant.
@@ -194,7 +215,7 @@ Reply types:
 - "question"
 - "exists"
 - "propose_add"
-- "propose_add_many"  (multiple independent proposals)
+- "propose_add_many"
 
 Rules:
 - "exists" ONLY if it is EXACTLY the same as a DB entry (same name + same weights).
@@ -209,19 +230,19 @@ JSON schema (exact keys, no extras):
   "type": "error" | "question" | "exists" | "propose_add" | "propose_add_many",
   "text": "string",
 
-  "choices": ["string", ...],  // optional, only for question
+  "choices": ["string", ...],
 
-  "id": "exercise_key",        // only for exists
-  "name": "string",            // only for exists
+  "id": "exercise_key",
+  "name": "string",
 
-  "proposal": {                // only for propose_add
+  "proposal": {
     "exercise_key": "string",
     "name": "string",
     "weights": { "group_id": number, ... },
     "confidence": number
   },
 
-  "proposals": [               // only for propose_add_many
+  "proposals": [
     {
       "exercise_key": "string",
       "name": "string",
@@ -259,7 +280,10 @@ foreach ($imageDataUrls as $u) {
     "image_url" => ["url" => $u, "detail" => "high"]
   ];
 }
-$currentContent[] = ["type" => "text", "text" => ($text !== "" ? $text : "(images only — describe what exercise(s) these show)")];
+$currentContent[] = [
+  "type" => "text",
+  "text" => ($text !== "" ? $text : "(images only — describe what exercise(s) these show)")
+];
 
 $modelMessages[] = ["role" => "user", "content" => $currentContent];
 
@@ -324,7 +348,6 @@ if (!is_array($assistantJson) || !isset($assistantJson["type"])) {
 $reply = $assistantJson;
 $type = (string)($reply["type"] ?? "error");
 
-// helper: normalize a proposal and validate weights+allowed groups
 $normProposal = function($p) use ($allowedSet, $dbExercises) {
   if (!is_array($p)) return null;
 
@@ -351,7 +374,6 @@ $normProposal = function($p) use ($allowedSet, $dbExercises) {
 
   if ($name === "" || !$cleanW) return null;
 
-  // exact match check
   $match = exactMatchExercise($dbExercises, $name, $cleanW);
   if ($match) {
     return [
@@ -378,7 +400,7 @@ if ($type === "propose_add") {
       "text" => "I’m not confident yet. What’s the exact exercise name and the main muscle it targets?",
       "choices" => ["Triceps", "Biceps", "Chest", "Back", "Legs", "Core"],
     ];
-  } else if (($p["__kind"] ?? "") === "exists") {
+  } elseif (($p["__kind"] ?? "") === "exists") {
     $reply = [
       "type" => "exists",
       "text" => "Exact match already exists in the database.",
@@ -399,6 +421,7 @@ if ($type === "propose_add") {
   } else {
     $outProposals = [];
     $foundExists = [];
+
     foreach (array_slice($arr, 0, 6) as $p0) {
       $p = $normProposal($p0);
       if ($p === null) continue;

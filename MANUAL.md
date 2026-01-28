@@ -2,239 +2,235 @@
 
 ## Overview
 
-MuscleMap is a web-based fitness tracking app with 3D muscle visualization, workout logging, exercise management, and an AI-powered exercise proposal system. It uses Three.js for interactive 3D body models (Z-Anatomy GLB), a MySQL backend for user data (single-user mode via `GLOBAL_USER_ID=0`), and xAI Grok for AI chat intake. Key features: heat-based muscle recovery visualization, per-muscle sensitivity calibration, workout CRUD, and AI exercise addition via image/text prompts.
-
-**Tech stack**: Vanilla JS/ESM + Three.js, PHP 8 (PDO/MySQL), no frameworks. Single-user (hardcoded `GLOBAL_USER_ID=0` in `api/db.php`).
+MuscleMap is a web-based fitness tracking app with 3D muscle visualization, workout logging, exercise management, and an AI-powered exercise proposal system via xAI Grok. It features heat-based muscle recovery visualization, per-muscle sensitivity calibration, workout CRUD, and AI exercise addition from text/image prompts. Multi-user support is partially migrated (PHP sessions via `api/db.php:require_user_id()`; login/register/logout; per-user data isolation). Tech: Vanilla JS/ESM + Three.js, PHP 8 (PDO/MySQL), single DB `musclemap`. Uploads: per-user `/uploads/ai_tmp/u{user_id}/{token}.ext` (24h TTL).
 
 ```
 High-Level Architecture (ASCII)
 
-[Browser: index.html / ai_chat.html]
+[Browser: index.html / ai_chat.html / login.html]
           |
           v
-[JS: main.js / ai_chat.js + lib/*.js (Three.js renderer, heat_engine.js, workout_ui.js)]
+[JS: main.js / ai_chat.js / lib/*.js (renderer3d.js, heat_engine.js, workout_ui.js)]
           |
           | fetch() / FormData
           v
-[PHP APIs: api/*.php (ai_chat.php, workout/*.php, add_exercises.php)]
+[PHP APIs: api/*.php (auth/*.php, workout/*.php, ai_chat.php, add_exercises.php)]
           |
-          | PDO queries
+          | PDO (user_id scoping via GLOBAL_USER_ID)
           v
-[MySQL: musclemap DB (exercises, workouts, workout_sets, etc.)]
+[MySQL: musclemap (users, exercises, workouts, workout_sets, muscle_sensitivity)]
           ^
-          | xAI Grok API (only ai_chat.php)
+          | xAI Grok (ai_chat.php only)
           |
-[Uploads: /uploads/ai_tmp/ (temp images for AI)]
+[Uploads: /uploads/ai_tmp/u{user_id}/ (AI images, 24h TTL)]
 ```
 
 ## 1) Directory/Module Map
 
 ```
 .
-├── index.html              # Main app: 3D viewer + workout UI + history
-├── ai_chat.html            # AI chat page: text/image -> exercise proposals
-├── ai_chat.css             # AI chat styles (sidebar preview, chat bubbles)
-├── style.css               # Core styles (3D viewer, sidebar panels)
-├── main.js                 # App bootstrap: renderer3d.js, heat_engine.js, workout_ui.js
-├── ai_chat.js              # AI chat logic: image upload, chat history (localStorage), 3D preview
+├── index.html              # Main: 3D viewer + workout UI + history
+├── ai_chat.html            # AI chat: text/image -> proposals + 3D preview
+├── login.html              # Auth: login/register/logout (new multi-user)
+├── ai_chat.css             # AI chat styles
+├── style.css               # Core styles
+├── main.js                 # Bootstrap: renderer3d, heat_engine, workout_ui
+├── ai_chat.js              # AI: uploadOneImage(), sendToServer(), renderReplyCard()
 ├── lib/
-│   ├── api.js              # API constants + apiJson() wrapper
-│   ├── exercises.js        # Cached /api/exercises_list.php fetch
-│   ├── heat_engine.js      # Core: rebuildMuscleFromLogs(), tick(), sensitivity support
-│   ├── muscleMap.js        # classifyMeshName(): mesh -> {kind: "gym/shell/ignore", groups:[]}
-│   ├── recovery.js         # computeHeat(), applyStimulus(), tickDecay()
-│   ├── recs.js             # generateRecs() from heat state
+│   ├── api.js              # apiJson() (401→login), API consts
+│   ├── exercises.js        # getAllExercisesCached() (exercises_list.php)
+│   ├── heat_engine.js      # rebuildMuscleFromLogs(), tick(), sensitivity
+│   ├── muscleMap.js        # classifyMeshName() → {kind:"gym",groups:[]}
+│   ├── recovery.js         # computeHeat(), applyStimulus() (sens-aware)
+│   ├── recs.js             # generateRecs() from heat
 │   ├── renderer3d.js       # Three.js: loadGLBWithFallback(), applyHeatToAllMeshes()
-│   ├── storage.js          # localStorage for heat state (legacy, not used)
-│   └── workout_ui.js       # Workout CRUD UI: renderWorkoutEditor(), boot()
+│   ├── storage.js          # localStorage (legacy)
+│   └── workout_ui.js       # CRUD: renderWorkoutEditor(), boot()
 ├── api/
-│   ├── db.php              # PDO setup, GLOBAL_USER_ID=0
-│   ├── exercises_list.php  # GET exercises (active)
-│   ├── add_exercises.php   # POST upsert exercise (user/ai source)
-│   ├── ai_chat.php         # POST {history,text,image_tokens} -> xAI -> normalized reply
-│   ├── ai_upload.php       # POST image -> token/url in /uploads/ai_tmp/
-│   ├── get_exercises.php   # GET exercises_custom (unused?)
-│   ├── get_logs.php        # GET workout_logs (legacy?)
-│   ├── log_workout.php     # POST legacy log (workout_date,exercise_id,etc.)
-│   ├── muscle_sensitivity.php # GET/POST {map:{group_id:sens}} sensitivity
-│   ├── state_reset.php     # POST DELETE workout_logs (commented out)
-│   └── workout/            # Modern workout APIs (_lib.php helpers)
-│       ├── _lib.php        # json_ok(), get_active_workout(), etc.
-│       ├── add_set.php     # POST {exercise_id,reps,stimulus,muscles}
-│       ├── delete_set.php  # POST {set_id}
-│       ├── end.php         # POST end active workout
-│       ├── get_current.php # GET active workout + sets
-│       ├── get_workout.php # GET ?id=N workout + sets
-│       ├── list_workouts.php # GET ?page=1&per=5 workouts
-│       ├── start.php       # POST start workout (idempotent)
-│       ├── status.php      # GET active workout summary
-│       └── update_set.php  # POST {set_id,reps,load_lbs,...}
-├── assets/models/          # body.glb / body.draco.glb (not provided)
-├── uploads/ai_tmp/         # Temp AI images {token}.jpg/png/webp (TTL 24h)
-└── vendor/three/           # Three.js + addons
+│   ├── db.php              # PDO, session_start(), require_user_id() → GLOBAL_USER_ID
+│   ├── auth/               # NEW multi-user
+│   │   ├── login.php       # POST {email,pass} → $_SESSION['user_id']
+│   │   ├── logout.php      # $_SESSION=[], session_destroy()
+│   │   └── register.php    # INSERT users → session
+│   ├── exercises_list.php  # GET active exercises (user_id scoped)
+│   ├── add_exercises.php   # POST upsert exercise (require_user_id())
+│   ├── ai_chat.php         # POST {history,text,image_tokens} → xAI → normProposal()
+│   ├── ai_upload.php       # POST image → /uploads/ai_tmp/u{uid}/{token}.ext
+│   ├── get_exercises.php   # GET exercises (legacy; require_user_id() added)
+│   ├── get_logs.php        # GET workout_logs (legacy; require_user_id())
+│   ├── log_workout.php     # POST legacy log → workout_sets (user_id())
+│   ├── muscle_sensitivity.php # GET/POST {map:{group:sens}} (require_user_id())
+│   ├── state_reset.php     # POST DELETE (commented; needs auth)
+│   └── workout/            # (all via _lib.php:require_user_id())
+│       ├── _lib.php        # json_ok(), get_active_workout(), autoclose_if_needed()
+│       ├── add_set.php
+│       ├── delete_set.php
+│       ├── end.php
+│       ├── get_current.php
+│       ├── get_workout.php
+│       ├── list_workouts.php
+│       ├── start.php
+│       ├── status.php
+│       └── update_set.php
+├── assets/models/          # body.glb etc. (not provided)
+├── uploads/ai_tmp/u{uid}/  # Per-user AI images (24h TTL)
+└── vendor/three/           # Three.js
 ```
 
 **Key modules**:
-- `main.js`: Wires renderer, heat engine, workout UI.
-- `ai_chat.js`: Chat composer, image upload (`uploadOneImage()`), 3D preview (`applyPreviewWeights()`).
-- `heat_engine.js`: `rebuildNow()`, `rebuildMuscleFromLogs()` (from workout_sets/logs).
-- `api/ai_chat.php`: xAI call, normalizes proposals (`normProposal()`), exact match check.
+- `main.js`: Wires renderer/heat/workout_ui; sensitivity UI.
+- `ai_chat.js`: Image upload (`uploadOneImage()`), chat (`sendToServer()`), preview (`applyPreviewWeights()`). Raw fetch (no 401 handling).
+- `heat_engine.js`: `rebuildNow()` from workout_sets; sensitivity integration.
+- `api/db.php`: `require_user_id()` enforces auth (401 on fail).
 
 ## 2) Data Model
 
-Inferred from PHP code/queries (no DB dump provided). All tables scoped to `user_id` (`GLOBAL_USER_ID=0`). JSON fields use `CAST(? AS JSON)`.
+Inferred from PHP queries/code (no DB dump). All scoped to `user_id` (GLOBAL_USER_ID post-auth). JSON via `CAST(? AS JSON)`.
+
+### users (inferred from api/auth/*.php)
+- `id` (int PK auto)
+- `email` (varchar UNIQUE)
+- `password_hash` (varchar)
 
 ### exercises
-- `user_id` (int, PK part): User ID (0).
-- `exercise_key` (varchar, PK/UNIQUE w/ user_id): snake_case id (e.g. "bench_press").
-- `name` (varchar): Display name.
-- `weights_json` (JSON): `{ "chest": 0.85, "triceps": 0.45 }` (0-1 floats, snake_case keys).
-- `source` (enum? "user"/"ai"): Added by.
-- `is_active` (tinyint=1): Filtered in lists.
-- `updated_at` (timestamp): ON DUPLICATE KEY UPDATE.
-
-**Upsert**: `api/add_exercises.php` validates id/name/weights, clamps 0-1.
+- `user_id` (int)
+- `exercise_key` (varchar PK/UNIQUE w/ user_id): snake_case
+- `name` (varchar)
+- `weights_json` (JSON): `{"chest":0.85,"triceps":0.45}` (0-1, snake_case)
+- `source` (varchar: "user"/"ai")
+- `is_active` (tinyint=1)
+- `updated_at` (timestamp)
 
 ### workouts
-- `id` (int PK auto).
-- `user_id` (int).
-- `started_at` (datetime).
-- `ended_at` (datetime NULL).
-- `auto_closed` (tinyint=0/1): 5h autoclose (`api/workout/_lib.php`).
-- `created_at`, `updated_at` (timestamp).
+- `id` (int PK auto)
+- `user_id` (int)
+- `started_at`/`ended_at` (datetime NULL)
+- `auto_closed` (tinyint)
+- `created_at`/`updated_at` (timestamp)
 
 ### workout_sets
-- `id` (int PK auto).
-- `workout_id` (int FK).
-- `user_id` (int).
-- `exercise_id` (varchar).
-- `exercise_name` (varchar snapshot).
-- `reps` (int 1-1000).
-- `load_lbs` (float NULL).
-- `stimulus` (float 0-5).
-- `muscles_json` (JSON): `{ "chest": 0.85 }` snapshot.
-- `created_at`, `updated_at` (timestamp).
-
-**Legacy**: `workout_logs` (similar fields, `workout_date` date, `sets` int).
+- `id` (int PK auto)
+- `workout_id` (int FK)
+- `user_id` (int)
+- `exercise_id`/`exercise_name` (varchar)
+- `reps` (int)
+- `load_lbs` (float NULL)
+- `stimulus` (float 0-5)
+- `muscles_json` (JSON snapshot)
+- `created_at`/`updated_at` (timestamp)
 
 ### muscle_sensitivity
-- `user_id` (int).
-- `group_id` (varchar PK/UNIQUE w/ user_id): e.g. "chest".
-- `sensitivity` (float 0.05-1.5).
-- `updated_at` (timestamp).
+- `user_id` (int)
+- `group_id` (varchar PK/UNIQUE w/ user_id): snake_case
+- `sensitivity` (float 0.05-1.5)
+- `updated_at` (timestamp)
 
-**Allowed groups** (`api/ai_chat.php`): abs_upper,abs_lower,obliques_external,... (26 total).
+### workout_logs (legacy)
+- Similar to workout_sets; `workout_date` (date)
 
-**Invariants**: Weights clamped 0-1, snake_case keys. Muscles snapshot in sets/logs. Single active workout (autoclose 5h).
+**Invariants**: Single active workout/user (5h autoclose `_lib.php`). Weights 0-1 snake_case. Snapshot muscles_json.
 
 ## 3) API Endpoints
 
-All return `{ok:bool, error?:str}` JSON. `credentials:"same-origin"`. User=0.
+All `{ok:bool,error?:str}` JSON. `credentials:"same-origin"`. Auth: `require_user_id()` (401 unauthorized if missing).
 
 | Path | Method | Request | Response | Errors/Notes |
 |------|--------|---------|----------|--------------|
-| `/api/exercises_list.php` | GET | - | `{exercises:[{id,name,w:{group:0.8}}]}` | Active exercises. Used by `exercises.js`. |
-| `/api/add_exercises.php` | POST | `{id:"snake_case",name:"Pushups",w:{chest:0.9},source?:"ai"}` | `{ok:true}` | Upsert, validates regex/clamps. Called by `ai_chat.js:acceptProposal()`. |
-| `/api/ai_upload.php` | POST | FormData `image` (jpg/png/webp <4.5MB) | `{token:"hex32",url:"./uploads/ai_tmp/..."}` | Temp store, 24h TTL cleanup. `ai_chat.js:onPickImages()`. |
-| `/api/ai_chat.php` | POST | `{history:[{role,text}],text?,image_tokens:["hex32"]}` | `{assistant:{text,reply:{type:"propose_add",proposal:{exercise_key,name,weights,confidence}},raw_json}}` | xAI Grok, normalizes proposals/exists. History slice(-40). |
-| `/api/muscle_sensitivity.php` | GET | - | `{map:{chest:1.15}}` | `main.js:loadSensitivityFromServer()`. |
-| `/api/muscle_sensitivity.php` | POST | `{map:{chest:1.15}}` OR `{group_id:"chest",sensitivity:1.15}` | `{saved:N}` | Clamp 0.05-1.5, upsert. |
-| `/api/workout/start.php` | POST/GET | - | `{workout:{id,started_at,summary:{sets_count,exercises_count,total_reps}}}` | Idempotent if active. 5h autoclose. |
-| `/api/workout/status.php` | GET | - | `{active:{id,started_at,ended_at,auto_closed,summary}}` OR `{active:null}` | `workout_ui.js:refreshStatus()`. |
-| `/api/workout/get_current.php` | GET | - | `{active:...,sets:[{id,exercise_id,reps,load_lbs,stimulus,muscles,...}]}` | Live workout sets. |
-| `/api/workout/add_set.php` | POST | `{exercise_id,reps,load_lbs?,stimulus,muscles:{group:0.8}}` | `{set:{...},summary}` | Adds to active. `workout_ui.js:addExerciseAsOneSet()`. |
-| `/api/workout/update_set.php` | POST | `{set_id,reps?,load_lbs?,stimulus?,muscles?}` | `{updated:true,summary}` | Partial update. |
+| `/api/auth/login.php` | POST | `{email:"...",password:"..."}` | `{ok:true,user_id:N}` | 401 invalid_credentials, 400 bad_email/password |
+| `/api/auth/register.php` | POST | `{email:"...",password:"..."}` | `{ok:true,user_id:N}` | 409 email_taken, 400 bad_email/password |
+| `/api/auth/logout.php` | POST | - | `{ok:true}` | Clears session |
+| `/api/exercises_list.php` | GET | - | `{exercises:[{id,name,w:{group:0.8}}]}` | Active, user-scoped |
+| `/api/add_exercises.php` | POST | `{id:"snake",name:"...",w:{chest:0.9},source?:"ai"}` | `{ok:true}` | Upsert, clamps/validates |
+| `/api/ai_upload.php` | POST | FormData `image` (<4.5MB jpg/png/webp) | `{token:"hex32",url:"./uploads/ai_tmp/uN/..."}` | Per-user dir, 24h TTL |
+| `/api/ai_chat.php` | POST | `{history:[{role,text}],text?,image_tokens:["hex32"]}` | `{assistant:{text,reply:{type:"propose_add",proposal:{...}},raw_json}}` | xAI, per-user exercises/images |
+| `/api/muscle_sensitivity.php` | GET | - | `{map:{chest:1.15}}` | User-scoped |
+| `/api/muscle_sensitivity.php` | POST | `{map:{chest:1.15}}` or `{group_id:"chest",sensitivity:1.15}` | `{saved:N}` | Clamp 0.05-1.5 |
+| `/api/workout/start.php` | POST/GET | - | `{workout:{id,started_at,summary}}` | Idempotent, autoclose 5h |
+| `/api/workout/status.php` | GET | - | `{active:{id,...}}` or `{active:null}` | Autoclose check |
+| `/api/workout/get_current.php` | GET | - | `{active:...,sets:[{id,exercise_id,reps,...}]}` | Live sets |
+| `/api/workout/add_set.php` | POST | `{exercise_id,reps,load_lbs?,stimulus,muscles:{group:0.8}}` | `{set:...,summary}` | To active workout |
+| `/api/workout/update_set.php` | POST | `{set_id,reps?,load_lbs?,stimulus?,muscles?}` | `{updated:true,summary}` | Partial |
 | `/api/workout/delete_set.php` | POST | `{set_id}` | `{deleted:true,summary}` | - |
-| `/api/workout/end.php` | POST/GET | - | `{ended:bool,workout_id,summary}` | Sets `ended_at`. |
-| `/api/workout/get_workout.php?id=N` | GET | - | `{workout:{id,started_at,...},sets:[...]}` | Past workout. `workout_ui.js:viewWorkout()`. |
-| `/api/workout/list_workouts.php?page=1&per=5` | GET | - | `{page,pages,per,total,workouts:[{id,started_at,summary}]}` | Paged history. |
+| `/api/workout/end.php` | POST/GET | - | `{ended:bool,...}` | Sets ended_at |
+| `/api/workout/get_workout.php?id=N` | GET | - | `{workout:...,sets:[...]}` | Past workout |
+| `/api/workout/list_workouts.php?page=1&per=5` | GET | - | `{workouts:[{id,summary}],pages}` | Paged, newest first |
+| `/api/get_logs.php?limit=N` | GET | - | `{rows:[workout_logs]}` | Legacy |
+| `/api/log_workout.php` | POST | Legacy `{date,exercise_id,...}` | `{ok:true}` | Migrates to workout_sets |
 
-**Errors**: `{ok:false,error:"msg"}` (400/500). Validation: missing keys, bad types, clamps.
+**Errors**: `{ok:false,error:"msg"}` (400/401/500/413). Auth 401→login.html (api.js).
 
 ## 4) Frontend Flow
 
-**Main app (`index.html` + `main.js`)**:
-1. Boot: `getAllExercisesCached()` -> populate `<select id="exerciseSelect">`, `heat.setExerciseWeightsById()`.
-2. `renderer3d.loadGLBWithFallback()` -> classifyMeshName() on meshes -> gymMeshes[].
-3. `workoutUI.boot()` -> refreshStatus() / loadCurrentWorkoutSets() / refreshHistory().
-4. `heat.rebuildNow()` -> fetch workouts/sets -> rebuildMuscleFromLogs() -> `renderer3d.applyHeatToAllMeshes()`.
-5. Loop (`animate()`): `heat.tick()` (decay) -> repaint / recs / timer.
-6. Workout: Start -> add_set.php -> `loadCurrentWorkoutSets()` -> `heat.setWorkoutSets()` (workout mode).
-7. Select muscle -> `setSelectedPanel()` -> sensitivity UI (`main.js:setSensUIValue()` from `heat.getSensitivityMap()`).
+**Main (`index.html` + `main.js`)**:
+1. `getAllExercisesCached()` → `<select id="exerciseSelect">`, `heat.setExerciseWeightsById()`.
+2. `renderer3d.loadGLBWithFallback()` → `classifyMeshName()` → gymMeshes.
+3. `workoutUI.boot()` → `refreshStatus()`/`loadCurrentWorkoutSets()`/`refreshHistory()`.
+4. `heat.rebuildNow()` → workout/list/get → `rebuildMuscleFromLogs()` → `applyHeatToAllMeshes()`.
+5. `animate()`: `heat.tick()` → repaint/recs/timer. Poll status 15s.
+6. Workout: `start.php` → `add_set.php` → `loadCurrentWorkoutSets()` → `heat.setWorkoutSets()`.
+7. Muscle select → `setSelectedPanel()` → sensitivity UI (`setSensUIValue()` from `heat.getSensitivityMap()`).
 
 **AI chat (`ai_chat.html` + `ai_chat.js`)**:
-1. Load history from localStorage (`LS_KEY="musclemap_ai_chat_v2"`).
-2. Image pick -> `onPickImages()` -> ai_upload.php -> attachments[] "ready".
-3. Send (`composer.submit`) -> `sendToServer({history,text,image_tokens})` -> ai_chat.php -> xAI -> reply card.
-4. Reply: "propose_add" -> 3D preview (`applyPreviewWeights(proposal.weights)`).
-5. Accept -> `acceptProposal()` -> add_exercises.php -> `bustExercisesCache()` (not called, manual refresh).
+1. localStorage history (`LS_KEY="musclemap_ai_chat_v2"`).
+2. Images → `onPickImages()` → `ai_upload.php` → tokens/urls.
+3. `composer.submit` → `sendToServer()` → `ai_chat.php` → reply card.
+4. "propose_add" → `applyPreviewWeights(proposal.weights)` (emissive).
+5. Accept → `acceptProposal()` → `add_exercises.php`.
 
-**End-to-end (AI add exercise)**: UI text/img -> ai_upload.php -> ai_chat.php (fetch exercises -> xAI w/ system prompt -> normProposal()) -> JS render card -> add_exercises.php -> DB.
+**Login (`login.html`)**: POST login/register → session → redirect index/ai_chat.
+
+**End-to-end AI**: UI img/text → `ai_upload.php` (u{uid}/) → `ai_chat.php` (exercises/xAI/norm) → card → `add_exercises.php` → DB.
 
 ## 5) AI Intake / MMJ schema explanation
 
-**Flow** (`ai_chat.php`): POST history/text/image_tokens -> resolve images (/uploads/ai_tmp/{token}.ext -> data:base64) -> system prompt w/ exercises JSON + allowed groups -> xAI "grok-4-0709" (temp=0.2) -> parse JSON reply -> normalize/enforce.
+**Flow** (`ai_chat.php`): `{history,text,image_tokens}` → per-user images (`/uploads/ai_tmp/u{uid}/{token}.*` → base64) → system prompt (user exercises + allowed groups) → xAI "grok-4-0709" (temp=0.2) → parse/normalize.
 
-**MMJ Schema** (exact, validated server-side):
+**MMJ Schema** (server-validated):
 ```json
-{
-  "type": "error|question|exists|propose_add|propose_add_many",
-  "text": "str",
-  "choices"?: ["str"],  // question only
-  "id"?: "ex_key", "name"?: "str",  // exists only
-  "proposal"?: {       // propose_add only
-    "exercise_key": "snake_case",
-    "name": "str",
-    "weights": {"abs_upper":0.75,...},  // allowed groups, 0-1
-    "confidence": 0.0-1.0
-  },
-  "proposals"?: [proposal...]  // propose_add_many (≤6)
-}
+{"type":"error|question|exists|propose_add|propose_add_many","text":"str","choices?":["str"],"id?":"ex_key","name?":"str","proposal?":{"exercise_key":"snake","name":"str","weights":{"abs_upper":0.75},"confidence":0.0-1.0},"proposals?":[...]}
 ```
-- **Allowed groups** (26): abs_upper,abs_lower,...core (hardcoded `$allowedIds`).
-- **normalizeId()**: snake_case [a-z0-9_]{2,64}.
-- **exactMatchExercise()**: name+weights exact (normalized).
-- **Fallbacks**: Bad proposal -> question. Exists -> "exists". Multi -> independent accepts.
+- Groups (26 hardcoded `$allowedIds`): abs_upper,...core.
+- `normalizeId()`: snake_case. `exactMatchExercise()`: name+weights.
+- Fallbacks: bad→question, exists→"exists".
 
-**JS rendering** (`ai_chat.js:renderReplyCard()`): Cards w/ Accept/Preview/Reject. Preview: `applyPreviewWeights()` (emissive color by max weight).
+**JS** (`ai_chat.js:renderReplyCard()`): Accept/Preview/Reject. Preview: emissive by max weight.
 
 ## 6) How to Extend
 
 **New exercise**:
-1. UI: ai_chat.html -> describe/img -> propose_add -> Accept (`add_exercises.php`).
-2. Manual: POST `/api/add_exercises.php` `{id:"new_squat",name:"Goblet Squat",w:{quads:0.9,glutes:0.7}}`.
-3. List refresh: `exercises.js:bustExercisesCache()`.
+1. AI chat → propose → Accept (`add_exercises.php`).
+2. Manual POST `/api/add_exercises.php`.
 
-**New muscle group**:
-1. `lib/muscleMap.js`: Add to `GROUPS` `{id:"new_group",label:"New",tokens:["muscle_name"]}`.
-2. `api/ai_chat.php`: Add to `$allowedIds`.
-3. 3D: Ensure `classifyMeshName()` matches -> "gym" w/ groups:["new_group"].
-4. Sensitivity: Auto-handled (`muscle_sensitivity.php`).
+**New muscle**:
+1. `lib/muscleMap.js`: `GROUPS` + `classifyMeshName()`.
+2. `api/ai_chat.php`: `$allowedIds`.
+3. Sensitivity auto (`muscle_sensitivity.php`).
 
 **New endpoint**:
-1. `api/new.php`: `require "db.php";` + `json_ok()/json_err()` from `_lib.php`.
-2. JS: `lib/api.js` add const, `apiJson(url)`.
-3. Validate: `require_keys()`, `intv()/floatv()` clamps.
+1. `api/new.php`: `require "db.php"; require_user_id();` + `json_ok()/json_err()`.
+2. `lib/api.js`: const + `apiJson()`.
 
-**New workout field**: Add to `workout_sets` schema + `add_set.php`/`update_set.php` + `workout_ui.js` inputs.
+**Multi-user**: Most migrated (`require_user_id()`). Remaining: `ai_chat.js` (raw fetch→apiJson), legacy `get_logs.php` etc.
 
-**AI prompt tweak**: Edit `$system` in `ai_chat.php` (regen on deploy).
+**AI tweak**: Edit `$system` in `ai_chat.php`.
 
 ## 7) Troubleshooting
 
 | Issue | Where to look |
 |-------|---------------|
-| "No model" | `assets/models/body.glb` missing/fail `loadGLBWithFallback()` (ai_chat.js/main.js). |
-| Heat blank | `heat.rebuildNow()` fail (no workouts), check `api/workout/list_workouts.php`. `classifyMeshName()` rejects meshes. |
-| AI "bad_json" | xAI key `/etc/musclemap/xai_api_key`, curl logs. Reply parse fail (strip `{}` in `ai_chat.php`). |
-| Upload fail | `/uploads/ai_tmp/` perms (775), size<4.5MB, jpg/png/webp (`ai_upload.php`). |
-| Exercises missing | `exercises` table empty, `is_active=1`. AI adds w/ `source:"ai"`. |
-| Sensitivity ignored | `heat.getSensitivityMap()` empty -> `api/muscle_sensitivity.php` GET. Clamps 0.05-1.5. |
-| Workout "no active" | Autoclose 5h (`_lib.php:autoclose_if_needed()`). `GLOBAL_USER_ID=0`. |
-| DB errors | `api/db.php` creds. PDO exceptions -> 500 `{error:"server_error"}`. |
-| CORS/cred | `credentials:"same-origin"`, same-origin only. |
+| 401 unauthorized | No session: login.html. Check `api/db.php:session_start()`. |
+| 500 DB | `api/db.php` creds/PDO. `users` table missing? |
+| No model | `assets/models/body.glb` fail `loadGLBWithFallback()`. |
+| Heat blank | No workouts: `api/workout/list_workouts.php`. `classifyMeshName()` rejects. |
+| AI bad_json | xAI key `/etc/musclemap/xai_api_key`. `ai_chat.php` parse. |
+| Upload fail | `/uploads/ai_tmp/u{uid}/` 775 perms, <4.5MB (`ai_upload.php`). |
+| Exercises missing | `exercises` empty/is_active=0. |
+| Sens ignored | `heat.getSensitivityMap()` empty → `api/muscle_sensitivity.php`. |
+| No active workout | 5h autoclose (`_lib.php`). |
+| ai_chat.js 401 silent | Raw fetch; wrap `apiJson()`. localStorage per-user prefix. |
+| Legacy logs | `get_logs.php`/`log_workout.php`: add `require_user_id()`. |
 
-**Logs**: PHP `error_log`, JS console. xAI: `api/ai_chat.php` curl `$httpCode/$rawResponse`.
+**Logs**: PHP error_log, JS console. xAI: `ai_chat.php` curl `$httpCode`.
 
 ## 8) Q&A
 
@@ -250,48 +246,60 @@ _Questions and answers are appended here over time._
 
 1. **DB changes** (low effort):
    - Add `users` table: `id (PK auto), email (UNIQUE), password_hash, created_at`. (Not present in code/DB dump.)
-   - All existing tables already filter `WHERE user_id = ?` (e.g., `api/exercises_list.php`, `api/workout/_lib.php:user_id()`), so data is isolated.
+   - All existing tables already filter `WHERE user_id = ?` (e.g., `api/exercises_list.php`, `api/workout/_lib.php:user_id()`), so data
 
-2. **Backend changes** (medium; ~5-10 files):
-   - `api/db.php`: Replace `define("GLOBAL_USER_ID", 0);` with session check:
-     ```php
-     session_start();
-     if (!isset($_SESSION['user_id'])) throw new Exception("unauth");
-     define("GLOBAL_USER_ID", (int)$_SESSION['user_id']);
-     ```
-     - Add `api/auth.php` endpoints: `login.php` (POST `{email,password}` → set `$_SESSION['user_id']`), `register.php`, `logout.php`.
-   - `api/workout/_lib.php`: `user_id()` already uses `GLOBAL_USER_ID`; no change.
-   - `api/ai_upload.php`: Per-user uploads → `/uploads/ai_tmp/{user_id}/{token}.ext` (update paths in `ai_chat.php` image resolution).
-   - `api/ai_chat.php`: Exercises fetched per-user (`WHERE user_id = :uid`); AI proposals already check per-user exact matches.
-   - Validate auth in all `api/*.php` (e.g., `if (!GLOBAL_USER_ID) bad("unauth", 401);`).
-   - Error: `{ok:false, error:"unauthorized"}` (new code 401).
+### Q: I want all the errors from this file to be logged, like a log folder that isn't git commited and that all the errors are writte in, we have log files title like errors-1-28-2026.log, how do we get this going, where errors.log is the one for the current day
+**Add error logging to `api/db.php`** (included by all APIs via `require`):
 
-3. **Frontend changes** (high; new pages + guards):
-   - New `login.html` + `login.js`: POST to `/api/login.php`, store `session` cookie (PHP `session_start()` handles).
-   - Protect `index.html`/`ai_chat.html`: Check `fetch("/api/workout/status.php")` → if 401, redirect to login.
-   - `main.js`/`ai_chat.js`: No user_id in payloads (PHP sessions); add logout btn → `fetch("/api/logout.php")`.
-   - `localStorage`: Prefix keys (e.g., `musclemap_ai_chat_v2_{user_id}`) or clear on logout.
-   - No change to Three.js/heat (per-session data).
+1. **Create logs dir** (run once):
+   ```
+   mkdir -p logs && chmod 775 logs
+   ```
+   Add to `.gitignore`:
+   ```
+   /logs/
+   ```
 
-4. **AI exercises**: Already per-user (`add_exercises.php` upserts w/ `user_id`); each account gets own list (`exercises_list.php` filters). No sharing.
+2. **In `api/db.php`** (after PDO setup, before auth helpers):
+   ```php
+   // Daily error logging (all APIs via require "db.php")
+   $logDir = __DIR__ . "/../logs";
+   if (!is_dir($logDir)) mkdir($logDir, 0775, true);
 
-5. **Invariants/edges preserved**:
-   - Single active workout per-user (autoclose in `_lib.php`).
-   - Sensitivities/exercises isolated.
-   - Validation/clamps unchanged.
+   $today = date("m-d-Y");  // e.g. "01-28-2026"
+   $logFile = "$logDir/errors-$today.log";
+   $currentLog = "$logDir/errors.log";  // symlink to today
 
-**Total new code**: ~200-400 LOC (auth endpoints + login page). Test: Login → add AI exercise → logout → login other → no crossover.
+   // Rotate symlink
+   if (is_file($currentLog)) unlink($currentLog);
+   symlink(basename($logFile), $currentLog);
 
-**Next inspect**: Add `users` table schema (missing); prototype `api/login.php` using `password_verify()`. No files block multi-user (all query `user_id`).
+   // Log ALL errors/fatal/exceptions here (project-wide)
+   ini_set("log_errors", 1);
+   ini_set("error_log", $logFile);
+   ini_set("display_errors", 0);  // JSON-only, no HTML spew
 
-### Q: do any of our files instead of pulling the variable from db.php just define it as 0? or is anythign built assumign that it is 0 or just ignores it
+   // Fatal handler (catches unhandled)
+   register_shutdown_function(function() use ($logFile) {
+     $e = error_get_last();
+     if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+       error_log("FATAL: {$e['message']} in {$e['file']}:{$e['line']}");
+     }
+   });
+   ```
 
-No files redefine `GLOBAL_USER_ID=0` themselves. All DB-interacting APIs `require`/`require_once` `api/db.php` (which defines it), then use `GLOBAL_USER_ID` directly in PDO queries (e.g., `api/add_exercises.php`, `api/exercises_list.php`, `api/ai_chat.php`, `api/log_workout.php`, `api/get_logs.php`).
+3. **Enhance `json_err()` / `mm_json_err()`** (in `api/db.php` / `api/workout/_lib.php`):
+   ```php
+   function json_err(string $msg, int $code = 400, array $extra = []): void {
+     error_log("API_ERR: $msg");  // logs to daily file
+     // ... existing JSON output
+   }
+   ```
 
-Two files add defensive fallbacks if undefined:
-- `api/muscle_sensitivity.php`: `$USER_ID = defined("GLOBAL_USER_ID") ? (int)GLOBAL_USER_ID : 0;`
-- `api/workout/_lib.php`: `function user_id(): int { return defined("GLOBAL_USER_ID") ? (int)GLOBAL_USER_ID : 0; }` (used by all `api/workout/*.php`).
+**Invariants/edges**:
+- Per-user via `GLOBAL_USER_ID`? No—logs are global (add `user_id:{$uid}` to msg if needed).
+- Rotation: Symlink auto-updates daily; old logs persist.
+- JS errors: Use `window.onerror` in `main.js`/`ai_chat.js` → `fetch("/logs/js_errors", {method:"POST",body:JSON.stringify(err)})` + new `api/js_errors.php`.
+- Test: `curl "http://your.site/api/workout/status.php"` (expect 401 logged as "unauthorized").
 
-No code assumes/ignores it—queries always filter `WHERE user_id = ?` with `GLOBAL_USER_ID` (or fallback 0). `api/ai_upload.php` has no DB/user_id.
-
-**Next inspect**: Search codebase for `user_id`/`GLOBAL_USER_ID` (grep); test undefine in `db.php` → all fallback to 0 (single-user safe).
+**Next inspect**: `error_log` perms (644 files, 775 dir); tail `-f logs/errors.log`. No DB logging (add `error_log("DB: " . $e->getMessage())` in try/catch). Not in provided files (grep `error_log` → none).
