@@ -1,5 +1,5 @@
 MuscleMap Refactor Snapshot (SAFE)
-Generated: 2026-01-25T12:14:22
+Generated: 2026-01-27T10:45:41
 Project root: /var/www/html/musclemap
 ================================================================================
 
@@ -9,17 +9,14 @@ Project root: /var/www/html/musclemap
 ################################################################################
 
 <?php
-// api/db.php
-
 declare(strict_types=1);
 
 $DB_HOST = [REDACTED];
 $DB_NAME = [REDACTED];
 $DB_USER = [REDACTED];
-$DB_PASS = [REDACTED];        // CHANGE
+$DB_PASS = [REDACTED];
 
 $dsn = "mysql:host={$DB_HOST};dbname={$DB_NAME};charset=utf8mb4";
-
 $options = [
   PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
   PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -28,8 +25,7 @@ $options = [
 
 $pdo = new PDO($dsn, $DB_USER, $DB_PASS, $options);
 
-// global user for now (shared DB)
-define("GLOBAL_USER_ID", 0);
+define ("GLOBAL_USER_ID", 0);
 
 ################################################################################
 # FILE: api/get_logs.php
@@ -165,30 +161,29 @@ echo json_encode(["ok" => true]);
 ################################################################################
 
 <?php
-// api/state_reset.php
-header("Content-Type: application/json; charset=utf-8");
+// // api/state_reset.php
+// header("Content-Type: application/json; charset=utf-8");
 
-require __DIR__ . "/db.php";
+// require __DIR__ . "/db.php";
 
-try {
-  $del = $pdo->prepare("DELETE FROM workout_logs WHERE user_id = ?");
-  $del->execute([GLOBAL_USER_ID]);
+// try {
+//   $del = $pdo->prepare("DELETE FROM workout_logs WHERE user_id = ?");
+//   $del->execute([GLOBAL_USER_ID]);
 
-  echo json_encode([
-    "ok" => true,
-    "deleted_logs" => $del->rowCount(),
-  ]);
-} catch (Throwable $e) {
-  http_response_code(500);
-  echo json_encode(["ok" => false, "error" => "EXCEPTION: " . $e->getMessage()]);
-}
+//   echo json_encode([
+//     "ok" => true,
+//     "deleted_logs" => $del->rowCount(),
+//   ]);
+// } catch (Throwable $e) {
+//   http_response_code(500);
+//   echo json_encode(["ok" => false, "error" => "EXCEPTION: " . $e->getMessage()]);
+// }
 
 ################################################################################
 # FILE: index.html
 ################################################################################
 
 <!-- index.html -->
-
 <!doctype html>
 <html lang="en">
 <head>
@@ -198,7 +193,6 @@ try {
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./style.css" />
 
-  <!-- Import map for local Three.js (downloaded into ./vendor/three/) -->
   <script type="importmap">
   {
     "imports": {
@@ -215,54 +209,71 @@ try {
       <div id="view" class="view"></div>
 
       <div class="hud">
-        <div class="hud-title">MuscleMap</div>
-        <div class="hud-sub">Click a muscle • Log a workout • Watch recovery colors</div>
+        <div class="hud-top">
+          <div class="hud-title">MuscleMap</div>
+          <a class="hud-link" href="./ai_chat.html">🤖 AI Exercise Builder</a>
+        </div>
+        <div class="hud-sub">Tap a muscle • Build a workout • Watch recovery colors</div>
+
+        <div class="hud-row">
+          <div class="seg" role="group" aria-label="Heat mode">
+            <button id="heatOverallBtn" class="seg-btn on" type="button">Overall heat</button>
+            <button id="heatWorkoutBtn" class="seg-btn" type="button" disabled>Workout heat</button>
+          </div>
+        </div>
       </div>
     </div>
 
     <aside class="sidebar">
+      <!-- Workout / Editor -->
       <div class="panel">
-        <div class="panel-title">Workout log</div>
+        <div class="panel-head">
+          <div class="panel-title" id="workTitle">Workout</div>
+          <div class="panel-actions">
+            <button id="startWorkoutBtn" class="btn" type="button">Start workout</button>
+            <button id="endWorkoutBtn" class="btn danger" type="button" disabled>End</button>
+          </div>
+        </div>
 
-        <form id="logForm" class="form">
-          <label class="field">
-            <span>Date</span>
-            <input id="dateInput" type="date" />
-          </label>
+        <div class="work-meta">
+          <div class="pill">
+            <span class="pill-k">Time</span>
+            <span class="pill-v" id="timerText">—</span>
+          </div>
+          <div class="pill">
+            <span class="pill-k">Status</span>
+            <span class="pill-v" id="statusText">No workout</span>
+          </div>
+        </div>
 
+        <div id="workControls" class="work-controls disabled">
           <label class="field">
             <span>Exercise</span>
             <select id="exerciseSelect"></select>
           </label>
+          <button id="addExerciseBtn" class="btn" type="button">Add exercise</button>
+        </div>
 
-          <div class="row">
-            <label class="field">
-              <span>Sets</span>
-              <input id="setsInput" type="number" min="1" max="50" value="3" />
-            </label>
-            <label class="field">
-              <span>Reps</span>
-              <input id="repsInput" type="number" min="1" max="200" value="10" />
-            </label>
-          </div>
+        <div id="workoutEditor" class="workout-editor">
+          <div class="muted">Start a workout to add exercises.</div>
+        </div>
 
-          <label class="field">
-            <span>Load (lbs) (optional)</span>
-            <input id="loadInput" type="number" min="0" step="1" placeholder="e.g. 25" />
-          </label>
-
-          <button class="btn" type="submit">Log workout</button>
-        </form>
+        <div id="editorFooter" class="editor-footer hidden">
+          <button id="discardEditBtn" class="btn secondary" type="button">Back</button>
+          <button id="saveEditBtn" class="btn" type="button">Save changes</button>
+        </div>
       </div>
 
+      <!-- Selected -->
       <div class="panel">
         <div class="panel-title">Selected</div>
         <div id="selectedBox" class="selected">
           <div class="selected-name">None</div>
-          <div class="selected-meta">Click a muscle.</div>
+          <div class="selected-meta">Tap a muscle.</div>
         </div>
       </div>
 
+      <!-- Legend -->
       <div class="panel">
         <div class="panel-title">Legend</div>
         <div class="legend">
@@ -274,6 +285,7 @@ try {
         </div>
       </div>
 
+      <!-- Recommendations -->
       <div class="panel">
         <div class="panel-title">Recommendations</div>
         <div id="recsBox" class="recs">
@@ -281,13 +293,21 @@ try {
         </div>
         <div class="row">
           <button id="recsBtn" class="btn secondary" type="button">Generate recs</button>
-          <button id="resetBtn" class="btn danger" type="button">Reset data</button>
+          <button id="resetBtn" class="btn danger" type="button">Reset (local)</button>
         </div>
       </div>
 
+      <!-- Workouts -->
       <div class="panel">
-        <div class="panel-title">Recent logs</div>
-        <div id="logsBox" class="logs"></div>
+        <div class="panel-head">
+          <div class="panel-title" id="historyTitle">Workouts</div>
+          <div class="panel-actions">
+            <button id="prevPageBtn" class="btn secondary" type="button">Prev</button>
+            <button id="nextPageBtn" class="btn secondary" type="button">Next</button>
+          </div>
+        </div>
+        <div id="historyBox" class="history"></div>
+        <div class="muted tiny" id="pageHint"></div>
       </div>
 
       <div class="panel footnote">
@@ -304,716 +324,65 @@ try {
 # FILE: style.css
 ################################################################################
 
-:root{
-  --bg:#0b0b0c;
-  --panel:#111114;
-  --panel2:#141419;
-  --text:#e8e8ea;
-  --muted:#9a9aa3;
-  --line:#24242b;
-  --btn:#2a2a33;
-  --btn2:#1f1f26;
-  --accent:#3cff7a;
-}
-
-*{ box-sizing:border-box; }
-html,body{ height:100%; margin:0; }
-
-body{
-  font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial;
-  background:var(--bg);
-  color:var(--text);
-}
-
-/* =================================================
-   MOBILE FIRST LAYOUT
-   ================================================= */
-
-.app{
-  height:100%;
-  display:flex;
-  flex-direction:column;
-}
-
-/* -------- Viewer (top ~66%) -------- */
-.viewer{
-  position:relative;
-  flex: 2 1 66%;
-  min-height:0;
-  border-bottom:1px solid var(--line);
-}
-
-.view{
-  width:100%;
-  height:100%;
-}
-
-/* HUD */
-.hud{
-  position:absolute;
-  left:12px;
-  top:12px;
-  padding:10px 12px;
-  background:rgba(10,10,12,0.65);
-  border:1px solid rgba(255,255,255,0.08);
-  border-radius:12px;
-  backdrop-filter: blur(6px);
-}
-.hud-title{ font-weight:700; letter-spacing:.2px; }
-.hud-sub{ color:var(--muted); font-size:12px; margin-top:2px; }
-
-/* -------- Controls (bottom ~34%) -------- */
-.sidebar{
-  flex: 1 1 34%;
-  overflow:auto;
-  padding:12px;
-  background:#0d0d10;
-}
-
-/* Panels */
-.panel{
-  background:var(--panel);
-  border:1px solid var(--line);
-  border-radius:14px;
-  padding:12px;
-  margin-bottom:12px;
-}
-
-.panel-title{
-  font-weight:700;
-  margin-bottom:10px;
-}
-
-/* Forms */
-.form{
-  display:flex;
-  flex-direction:column;
-  gap:10px;
-}
-
-.field{
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-}
-.field span{
-  color:var(--muted);
-  font-size:12px;
-}
-
-input,select{
-  width:100%;
-  padding:10px;
-  background:var(--panel2);
-  border:1px solid var(--line);
-  border-radius:10px;
-  color:var(--text);
-  outline:none;
-}
-
-input:focus,select:focus{
-  border-color: rgba(60,255,122,0.35);
-}
-
-.row{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:10px;
-}
-
-.btn{
-  padding:10px 12px;
-  background:var(--btn);
-  border:1px solid var(--line);
-  border-radius:10px;
-  color:var(--text);
-  cursor:pointer;
-  font-weight:600;
-}
-.btn:hover{ background:#30303a; }
-
-.btn.secondary{
-  background:var(--btn2);
-}
-.btn.secondary:hover{ background:#2a2a33; }
-
-.btn.danger{
-  background:#2a1517;
-  border-color:#3a1f22;
-}
-.btn.danger:hover{ background:#351a1d; }
-
-/* Selected */
-.selected{
-  background:var(--panel2);
-  border:1px solid var(--line);
-  border-radius:12px;
-  padding:10px;
-}
-.selected-name{ font-weight:700; }
-.selected-meta{
-  color:var(--muted);
-  font-size:12px;
-  margin-top:4px;
-}
-
-/* Legend */
-.legend{
-  display:flex;
-  flex-direction:column;
-  gap:8px;
-}
-.legend-row{
-  display:flex;
-  gap:10px;
-  align-items:center;
-  color:var(--muted);
-}
-.swatch{
-  width:14px;
-  height:14px;
-  border-radius:4px;
-  border:1px solid rgba(255,255,255,0.12);
-}
-.s-gray{ background:#7a7a7a; }
-.s-green{ background:#3cff7a; }
-.s-yellow{ background:#ffd84d; }
-.s-orange{ background:#ff9b3c; }
-.s-red{ background:#ff3c3c; }
-
-/* Recs */
-.recs{
-  background:var(--panel2);
-  border:1px solid var(--line);
-  border-radius:12px;
-  padding:10px;
-  min-height:54px;
-  color:var(--muted);
-}
-.recs .rec{
-  padding:8px 0;
-  border-top:1px solid rgba(255,255,255,0.06);
-}
-.recs .rec:first-child{ border-top:none; }
-
-/* Logs */
-.logs{
-  display:flex;
-  flex-direction:column;
-  gap:8px;
-}
-.log{
-  background:var(--panel2);
-  border:1px solid var(--line);
-  border-radius:12px;
-  padding:10px;
-}
-.log-top{
-  display:flex;
-  justify-content:space-between;
-  gap:10px;
-}
-.log-ex{ font-weight:700; }
-.log-date{
-  color:var(--muted);
-  font-size:12px;
-}
-.log-meta{
-  color:var(--muted);
-  font-size:12px;
-  margin-top:4px;
-}
-
-.muted{ color:var(--muted); }
-.footnote{
-  color:var(--muted);
-  font-size:12px;
-}
-
-/* =================================================
-   DESKTOP OVERRIDE (UNCHANGED BEHAVIOR)
-   ================================================= */
-@media (min-width: 900px){
-
-  .app{
-    display:grid;
-    grid-template-columns: 1fr 360px;
-  }
-
-  .viewer{
-    border-bottom:none;
-    border-right:1px solid var(--line);
-  }
-
-  .sidebar{
-    height:100%;
-    flex:none;
-  }
-}
-
+/* style.css */ :root{ --bg:#0b0b0c; --panel:#111114; --panel2:#141419; --text:#e8e8ea; --muted:#9a9aa3; --line:#24242b; --btn:#2a2a33; --btn2:#1f1f26; --accent:#3cff7a; --warn:#ff9b3c; --bad:#ff3c3c; } *{ box-sizing:border-box; } html,body{ height:100%; margin:0; } body{ font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--text); } /* ================================================= MOBILE FIRST LAYOUT ================================================= */ .app{ height:100%; display:flex; flex-direction:column; } /* -------- Viewer -------- */ .viewer{ position:relative; flex: 2 1 66%; min-height:0; border-bottom:1px solid var(--line); } .view{ width:100%; height:100%; } /* HUD */ .hud{ position:absolute; left:12px; right:12px; top:12px; padding:10px 12px; background:rgba(10,10,12,0.65); border:1px solid rgba(255,255,255,0.08); border-radius:12px; backdrop-filter: blur(6px); } .hud-top{ display:flex; justify-content:space-between; align-items:center; gap:10px; } .hud-title{ font-weight:700; letter-spacing:.2px; } .hud-link{ color:var(--text); text-decoration:none; font-weight:600; padding:6px 10px; border:1px solid rgba(255,255,255,0.10); background:rgba(20,20,25,0.55); border-radius:999px; white-space:nowrap; } .hud-link:hover{ border-color: rgba(60,255,122,0.25); } .hud-sub{ color:var(--muted); font-size:12px; margin-top:4px; } .hud-row{ margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; } .seg{ display:flex; gap:0; border:1px solid rgba(255,255,255,0.10); border-radius:12px; overflow:hidden; } .seg-btn{ background:rgba(20,20,25,0.55); color:var(--text); border:0; padding:8px 10px; font-weight:700; cursor:pointer; } .seg-btn.on{ background:rgba(60,255,122,0.18); } .seg-btn:disabled{ opacity:0.5; cursor:not-allowed; } /* -------- Sidebar -------- */ .sidebar{ flex: 1 1 34%; overflow:auto; padding:12px; background:#0d0d10; } .panel{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px; margin-bottom:12px; } .panel-title{ font-weight:700; margin:0; } .panel-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; } .panel-actions{ display:flex; gap:8px; align-items:center; } .work-meta{ display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 10px 0; } .pill{ display:flex; gap:8px; align-items:center; padding:6px 10px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); } .pill-k{ color:var(--muted); font-size:12px; } .pill-v{ font-weight:800; } .work-controls{ display:flex; gap:10px; align-items:flex-end; margin-bottom:10px; } .work-controls.disabled{ opacity:0.55; pointer-events:none; } .form{ display:flex; flex-direction:column; gap:10px; } .field{ display:flex; flex-direction:column; gap:6px; } .field span{ color:var(--muted); font-size:12px; } input,select{ width:100%; padding:10px; background:var(--panel2); border:1px solid var(--line); border-radius:10px; color:var(--text); outline:none; } input:focus,select:focus{ border-color: rgba(60,255,122,0.35); } .row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; } .btn{ padding:10px 12px; background:var(--btn); border:1px solid var(--line); border-radius:10px; color:var(--text); cursor:pointer; font-weight:800; } .btn:hover{ background:#30303a; } .btn.secondary{ background:var(--btn2); } .btn.secondary:hover{ background:#2a2a33; } .btn.danger{ background:#2a1517; border-color:#3a1f22; } .btn.danger:hover{ background:#351a1d; } .btn:disabled{ opacity:0.55; cursor:not-allowed; } /* Workout editor */ .workout-editor{ display:flex; flex-direction:column; gap:10px; } .excard{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; } .excard-top{ display:flex; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:10px; } .ex-name{ font-weight:900; line-height:1.2; } .ex-sub{ color:var(--muted); font-size:12px; margin-top:2px; } .sets{ display:flex; flex-direction:column; gap:8px; } .setrow{ display:grid; grid-template-columns: 1fr 1fr auto; gap:8px; align-items:center; } .setrow input{ padding:9px 10px; } .iconbtn{ width:38px; height:38px; display:grid; place-items:center; border-radius:10px; border:1px solid var(--line); background:rgba(0,0,0,0.20); color:var(--text); cursor:pointer; font-weight:900; } .iconbtn:hover{ background:rgba(255,255,255,0.06); } .iconbtn.bad:hover{ background:rgba(255,60,60,0.10); border-color: rgba(255,60,60,0.25); } .ex-actions{ display:flex; gap:8px; margin-top:10px; } .editor-footer{ display:flex; gap:10px; margin-top:10px; } .hidden{ display:none !important; } /* Selected */ .selected{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; } .selected-name{ font-weight:900; } .selected-meta{ color:var(--muted); font-size:12px; margin-top:4px; } /* Legend */ .legend{ display:flex; flex-direction:column; gap:8px; } .legend-row{ display:flex; gap:10px; align-items:center; color:var(--muted); } .swatch{ width:14px; height:14px; border-radius:4px; border:1px solid rgba(255,255,255,0.12); } .s-gray{ background:#7a7a7a; } .s-green{ background:#3cff7a; } .s-yellow{ background:#ffd84d; } .s-orange{ background:#ff9b3c; } .s-red{ background:#ff3c3c; } /* Recs */ .recs{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; min-height:54px; color:var(--muted); } .recs .rec{ padding:8px 0; border-top:1px solid rgba(255,255,255,0.06); } .recs .rec:first-child{ border-top:none; } /* History */ .history{ display:flex; flex-direction:column; gap:10px; } .workcard{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; cursor:pointer; } .workcard:hover{ border-color: rgba(60,255,122,0.25); } .workcard-top{ display:flex; justify-content:space-between; gap:10px; align-items:center; } .workcard-title{ font-weight:900; } .workcard-meta{ color:var(--muted); font-size:12px; margin-top:4px; } .badge{ font-size:12px; font-weight:900; padding:4px 8px; border-radius:999px; border:1px solid rgba(255,255,255,0.10); background:rgba(0,0,0,0.25); white-space:nowrap; } .badge.live{ border-color: rgba(60,255,122,0.25); background: rgba(60,255,122,0.12); } .muted{ color:var(--muted); } .tiny{ font-size:12px; } .footnote{ color:var(--muted); font-size:12px; } /* ================================================= DESKTOP OVERRIDE ================================================= */ @media (min-width: 900px){ .app{ display:grid; grid-template-columns: 1fr 380px; } .viewer{ border-bottom:none; border-right:1px solid var(--line); } .sidebar{ height:100%; flex:none; } }
 ################################################################################
 # FILE: main.js
 ################################################################################
 
 // main.js
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-
-import { getAllExercisesCached, getExerciseById } from "./lib/exercises.js";
+import { getAllExercisesCached } from "./lib/exercises.js";
 import { classifyMeshName } from "./lib/muscleMap.js";
 import { computeHeat } from "./lib/recovery.js";
 import { generateRecs } from "./lib/recs.js";
 
-/* ==============================
-   PHP API endpoints
-============================== */
-const API_LOGS_GET     = "./api/get_logs.php";
-const API_WORKOUT_LOG  = "./api/log_workout.php";
-const API_STATE_RESET  = "./api/state_reset.php";
+import { API, apiJson, resetStateServer } from "./lib/api.js";
+import { createHeatEngine } from "./lib/heat_engine.js";
+import { createRenderer3D } from "./lib/renderer3d.js";
+import { createWorkoutUI } from "./lib/workout_ui.js";
 
-/* ----------------------------- DOM refs ----------------------------- */
+/* ==============================
+   DOM refs
+============================== */
 const mount = document.getElementById("view");
 if (!mount) throw new Error("Missing #view element");
 
-const logForm = document.getElementById("logForm");
-const dateInput = document.getElementById("dateInput");
-const exerciseSelect = document.getElementById("exerciseSelect");
-const setsInput = document.getElementById("setsInput");
-const repsInput = document.getElementById("repsInput");
-const loadInput = document.getElementById("loadInput");
+const heatOverallBtn = document.getElementById("heatOverallBtn");
+const heatWorkoutBtn = document.getElementById("heatWorkoutBtn");
 
 const selectedBox = document.getElementById("selectedBox");
+
 const recsBox = document.getElementById("recsBox");
 const recsBtn = document.getElementById("recsBtn");
 const resetBtn = document.getElementById("resetBtn");
-const logsBox = document.getElementById("logsBox");
 
-/* ----------------------------- State ----------------------------- */
-let state = {
-  logs: [],
-  muscle: {},     // derived from logs: { groupId: { load, lastTrained, lastPing } }
-  lastUpdate: Date.now(),
-};
+const startWorkoutBtn = document.getElementById("startWorkoutBtn");
+const endWorkoutBtn = document.getElementById("endWorkoutBtn");
 
-let exerciseWeightsById = {}; // { exerciseId: {gid: weight} }
+const workTitle = document.getElementById("workTitle");
+const timerText = document.getElementById("timerText");
+const statusText = document.getElementById("statusText");
 
-/* ----------------------------- API helpers ----------------------------- */
-async function apiJson(url, opts = {}) {
-  const res = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...opts,
-    headers: {
-      ...(opts.headers || {}),
-      "Content-Type": "application/json",
-    },
-  });
+const workControls = document.getElementById("workControls");
+const exerciseSelect = document.getElementById("exerciseSelect");
+const addExerciseBtn = document.getElementById("addExerciseBtn");
 
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`API ${url} returned non-JSON:\n${text.slice(0, 500)}`);
-  }
+const workoutEditor = document.getElementById("workoutEditor");
+const editorFooter = document.getElementById("editorFooter");
+const discardEditBtn = document.getElementById("discardEditBtn");
+const saveEditBtn = document.getElementById("saveEditBtn");
 
-  if (!res.ok || data?.ok === false) {
-    throw new Error(data?.error || `HTTP ${res.status} from ${url}`);
-  }
-  return data;
-}
+const historyBox = document.getElementById("historyBox");
+const prevPageBtn = document.getElementById("prevPageBtn");
+const nextPageBtn = document.getElementById("nextPageBtn");
+const pageHint = document.getElementById("pageHint");
 
-/* ----------------------------- Logs ----------------------------- */
-async function loadLogsServer() {
-  const data = await apiJson(API_LOGS_GET, { method: "GET" });
-  const rows = Array.isArray(data.rows) ? data.rows : [];
-
-  state.logs = rows.map((r) => ({
-    id: String(r.id),
-    date: String(r.workout_date),
-    exerciseId: String(r.exercise_id),
-    exerciseName: String(r.exercise_name),
-    sets: Number(r.sets),
-    reps: Number(r.reps),
-    loadLbs: r.load_lbs === null || r.load_lbs === undefined ? null : Number(r.load_lbs),
-    stimulus: Number(r.stimulus),
-    createdAt: String(r.created_at || ""),
-    muscles: (() => {
-      const mj = r.muscles_json;
-      if (!mj) return null;
-      if (typeof mj === "object") return mj;
-      if (typeof mj === "string") {
-        try { return JSON.parse(mj); } catch { return null; }
-      }
-      return null;
-    })(),
-  }));
-
-  state.lastUpdate = Date.now();
-}
-
-/* ----------------------------- Derived muscle state from logs ----------------------------- */
+/* ==============================
+   Small utils kept here
+============================== */
 function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
-function hours(ms) {
-  return ms / (1000 * 60 * 60);
-}
-function parseSqlDateTime(s) {
-  // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS"
-  if (!s) return null;
-  const iso = s.replace(" ", "T");
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
 
-function rebuildMuscleFromLogs(now = Date.now()) {
-  const muscle = {};
-  const halfLifeHrs = 36;
-
-  const ensure = (gid) => {
-    if (!muscle[gid]) muscle[gid] = { load: 0, lastTrained: 0, lastPing: 0 };
-    return muscle[gid];
-  };
-
-  for (const l of state.logs) {
-    const dt = parseSqlDateTime(l.createdAt);
-    if (!dt) continue;
-    const tMs = dt.getTime();
-
-    const ageMs = now - tMs;
-    const decay = Math.pow(0.5, hours(ageMs) / halfLifeHrs);
-
-    const wmap =
-      (l.muscles && typeof l.muscles === "object")
-        ? l.muscles
-        : (exerciseWeightsById[l.exerciseId] || null);
-
-    if (!wmap) continue;
-
-    const stim = Number(l.stimulus) || 0;
-    if (!(stim > 0)) continue;
-
-    for (const [gidRaw, wRaw] of Object.entries(wmap)) {
-      const gid = String(gidRaw || "").trim();
-      const w = Number(wRaw);
-      if (!gid || !Number.isFinite(w) || w <= 0) continue;
-
-      const m = ensure(gid);
-      const add = stim * w * decay;
-      if (!(add > 0)) continue;
-
-      m.load = clamp01(m.load + add);
-      m.lastTrained = Math.max(m.lastTrained, tMs);
-    }
-  }
-
-  state.muscle = muscle;
-  state.lastUpdate = now;
-}
-
-/* ----------------------------- Three.js setup ----------------------------- */
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.setSize(mount.clientWidth, mount.clientHeight);
-renderer.setClearColor(0x0b0b0c, 1);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-mount.appendChild(renderer.domElement);
-
-const scene = new THREE.Scene();
-
-const camera = new THREE.PerspectiveCamera(
-  45,
-  mount.clientWidth / mount.clientHeight,
-  0.01,
-  5000
-);
-camera.position.set(0, 160, 380);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.target.set(0, 120, 0);
-
-// lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x202020, 0.55));
-const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-dir.position.set(250, 450, 250);
-scene.add(dir);
-
-// grid
-const grid = new THREE.GridHelper(800, 40, 0x2a2a2a, 0x181818);
-grid.position.y = 0;
-scene.add(grid);
-
-/* ----------------------------- Model bookkeeping ----------------------------- */
-let currentModel = null;
-const skinShellMeshes = [];
-const gymMeshes = [];
-const pickables = [];
-let selectedMesh = null;
-
-/* ----------------------------- Materials ----------------------------- */
-function makeBaselineMuscleMaterial() {
-  return new THREE.MeshStandardMaterial({
-    color: 0x7a7a7a,
-    roughness: 0.88,
-    metalness: 0.0,
-    emissive: new THREE.Color(0x000000),
-    emissiveIntensity: 0.0,
-  });
-}
-
-function makeSkinMaterial() {
-  return new THREE.MeshStandardMaterial({
-    color: 0x8e8e94,
-    roughness: 0.95,
-    metalness: 0.0,
-    transparent: true,
-    opacity: 0.32,
-    emissive: new THREE.Color(0x000000),
-    emissiveIntensity: 0.0,
-    depthWrite: false,
-  });
-}
-
-function applySelectionLook(mesh) {
-  if (!mesh?.material) return;
-  mesh.material.emissive = new THREE.Color(0x18a944);
-  mesh.material.emissiveIntensity = 1.15;
-  mesh.material.color = new THREE.Color(0x3cff7a);
-  mesh.material.wireframe = true;
-  mesh.material.needsUpdate = true;
-}
-
-function clearSelectionLook(mesh) {
-  if (!mesh?.material) return;
-  mesh.material.wireframe = false;
-  mesh.material.needsUpdate = true;
-}
-
-/* ----------------------------- Heat ----------------------------- */
-function heatToVisual(heat, overdo) {
-  const h = clamp01(heat);
-
-  let color = new THREE.Color(0x7a7a7a);
-  let emissive = new THREE.Color(0x000000);
-  let eI = 0.0;
-
-  if (overdo) {
-    color = new THREE.Color(0xff3c3c);
-    emissive = new THREE.Color(0xff3c3c);
-    eI = 1.25;
-    return { color, emissive, emissiveIntensity: eI };
-  }
-
-  if (h < 0.12) return { color, emissive, emissiveIntensity: eI };
-
-  if (h < 0.35) emissive = new THREE.Color(0x3cff7a);
-  else if (h < 0.6) emissive = new THREE.Color(0xffd84d);
-  else emissive = new THREE.Color(0xff9b3c);
-
-  return { color, emissive, emissiveIntensity: 0.8 };
-}
-
-/* ----------------------------- Loading model ----------------------------- */
-function frameObject(obj) {
-  const box = new THREE.Box3().setFromObject(obj);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-
-  controls.target.copy(center);
-
-  const maxDim = Math.max(size.x, size.y, size.z);
-  const dist = maxDim * 1.25;
-
-  camera.position.set(center.x, center.y + maxDim * 0.15, center.z + dist);
-  camera.near = Math.max(0.01, maxDim / 1000);
-  camera.far = maxDim * 20;
-  camera.updateProjectionMatrix();
-}
-
-function clearModel() {
-  if (currentModel) scene.remove(currentModel);
-  currentModel = null;
-  skinShellMeshes.length = 0;
-  gymMeshes.length = 0;
-  pickables.length = 0;
-  selectedMesh = null;
-}
-
-async function loadGLBWithFallback() {
-  const candidates = [
-    "./assets/models/body.glb",
-    "./assets/models/body.draco.glb",
-  ];
-
-  for (const url of candidates) {
-    try {
-      await loadGLB(url);
-      return;
-    } catch (e) {
-      console.warn("[GLB] failed:", url, e?.message || e);
-    }
-  }
-
-  throw new Error("Could not load any model. Put body.glb in assets/models/.");
-}
-
-function loadGLB(url) {
-  clearModel();
-  const loader = new GLTFLoader();
-
-  return new Promise((resolve, reject) => {
-    loader.load(
-      url,
-      (gltf) => {
-        const model = gltf.scene;
-        currentModel = model;
-
-        model.scale.setScalar(1);
-        model.position.set(0, 0, 0);
-
-        applyClassification(model);
-        scene.add(model);
-        frameObject(model);
-
-        applyHeatToAllMeshes();
-        resolve();
-      },
-      undefined,
-      (err) => reject(err)
-    );
-  });
-}
-
-function applyClassification(root) {
-  const skinMat = makeSkinMaterial();
-
-  root.traverse((obj) => {
-    if (!obj.isMesh) return;
-
-    const info = classifyMeshName(obj.name);
-
-    if (info.kind === "shell") {
-      obj.material = skinMat;
-      obj.renderOrder = 2;
-      obj.frustumCulled = true;
-      obj.visible = true;
-      skinShellMeshes.push(obj);
-      return;
-    }
-
-    if (info.kind === "gym") {
-      obj.visible = true;
-      obj.renderOrder = 1;
-      obj.frustumCulled = true;
-
-      const base = makeBaselineMuscleMaterial();
-      obj.material = base;
-      obj.userData._muscle = {
-        groups: info.groups || [],
-        baseMaterial: base,
-      };
-
-      gymMeshes.push({ mesh: obj, groups: obj.userData._muscle.groups });
-      pickables.push(obj);
-      return;
-    }
-
-    obj.visible = false;
-  });
-}
-
-/* ----------------------------- Picking ----------------------------- */
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-let downAt = null;
-
-function getPointerNDC(ev) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.set(
-    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
-    -(((ev.clientY - rect.top) / rect.height) * 2 - 1)
-  );
-}
-
-renderer.domElement.addEventListener("pointerdown", (ev) => {
-  downAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
-});
-
-renderer.domElement.addEventListener("pointerup", (ev) => {
-  if (!downAt) return;
-  const dx = Math.abs(ev.clientX - downAt.x);
-  const dy = Math.abs(ev.clientY - downAt.y);
-  const dt = performance.now() - downAt.t;
-  downAt = null;
-  if (dx > 6 || dy > 6 || dt > 500) return;
-
-  getPointerNDC(ev);
-  raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(pickables, true);
-  if (!hits.length) return clearSelected();
-  setSelected(hits[0].object);
-});
-
-/* ----------------------------- Selection ----------------------------- */
-function prettyGroupId(id) {
-  return (id || "")
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-function setSelected(mesh) {
-  if (selectedMesh === mesh) return clearSelected();
-  clearSelected();
-  selectedMesh = mesh;
-
-  applyHeatToMesh(mesh);
-  applySelectionLook(mesh);
-
-  const groups = mesh.userData?._muscle?.groups || [];
-  selectedBox.querySelector(".selected-name").textContent = mesh.name || "(unnamed)";
-  selectedBox.querySelector(".selected-meta").textContent =
-    groups.length ? groups.map(prettyGroupId).join(", ") : "Unknown";
-}
-
-function clearSelected() {
-  if (!selectedMesh) return;
-  clearSelectionLook(selectedMesh);
-  applyHeatToMesh(selectedMesh);
-  selectedMesh = null;
-  selectedBox.querySelector(".selected-name").textContent = "None";
-  selectedBox.querySelector(".selected-meta").textContent = "Click a muscle.";
-}
-
-/* ----------------------------- Heat apply ----------------------------- */
-function applyHeatToMesh(mesh, now = Date.now()) {
-  const groups = mesh.userData?._muscle?.groups || [];
-  let maxHeat = 0;
-  let overdo = false;
-
-  for (const g of groups) {
-    const h = computeHeat(state, g, now);
-    maxHeat = Math.max(maxHeat, h.heat);
-    if (h.overdo) overdo = true;
-  }
-
-  const v = heatToVisual(maxHeat, overdo);
-  mesh.material.color = v.color;
-  mesh.material.emissive = v.emissive;
-  mesh.material.emissiveIntensity = v.emissiveIntensity;
-  mesh.material.wireframe = false;
-}
-
-function applyHeatToAllMeshes(now = Date.now()) {
-  for (const { mesh } of gymMeshes) applyHeatToMesh(mesh, now);
-  if (selectedMesh) applySelectionLook(selectedMesh);
-}
-
-/* ----------------------------- Recs ----------------------------- */
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -1024,157 +393,173 @@ function escapeHtml(s) {
   }[c]));
 }
 
-function renderRecs() {
+function prettyGroupId(id) {
+  return (id || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// per-set stimulus formula (same as your old one, just isolated)
+function computeStimulusSingleSet(reps, loadLbs) {
+  const vol = Math.max(1, reps);
+  let loadFactor = 1.0;
+  if (Number.isFinite(loadLbs) && loadLbs > 0) {
+    loadFactor = 1.0 + Math.min(1.0, loadLbs / 200);
+  }
+  const base = (vol / 12) * loadFactor;
+  return clamp01(base);
+}
+
+/* ==============================
+   Heat engine
+============================== */
+const heat = createHeatEngine({
+  apiJson,
+  API,
+  historyPerPage: 5,
+  maxWorkouts: 40,
+  maxAgeMs: 2 * 60 * 1000,
+});
+
+/* ==============================
+   Selected panel UI
+============================== */
+function setSelectedPanel({ name, groups }) {
+  if (!selectedBox) return;
+  const nameEl = selectedBox.querySelector(".selected-name");
+  const metaEl = selectedBox.querySelector(".selected-meta");
+  if (nameEl) nameEl.textContent = name || "None";
+  if (metaEl) metaEl.textContent = (groups && groups.length)
+    ? groups.map(prettyGroupId).join(", ")
+    : "Tap a muscle.";
+}
+
+/* ==============================
+   Renderer
+============================== */
+const renderer3d = createRenderer3D({
+  mount,
+  classifyMeshName,
+  computeHeat,
+  onSelect: ({ name, groups }) => {
+    setSelectedPanel({ name: name || "None", groups: groups || [] });
+  },
+});
+
+/* ==============================
+   Recs render
+============================== */
+function renderRecsFromState(state, now = Date.now()) {
   if (!recsBox) return;
 
-  const groupSet = new Set();
-  for (const { groups } of gymMeshes) for (const g of groups) groupSet.add(g);
+  const groupIds = renderer3d.getAllGroupIds();
+  const recs = generateRecs(state, groupIds, now);
 
-  const recs = generateRecs(state, [...groupSet], Date.now());
   recsBox.innerHTML = recs.length
     ? recs.map((r) => `<div class="rec">${escapeHtml(r.text)}</div>`).join("")
     : `<div class="muted">Looking balanced. Keep it up.</div>`;
 }
 
-/* ----------------------------- Logs UI ----------------------------- */
-function renderLogs() {
-  const out = state.logs.slice(0, 20).map((l) => `
-    <div class="log">
-      <div class="log-top">
-        <div class="log-ex">${escapeHtml(l.exerciseName)}</div>
-        <div class="log-date">${escapeHtml(l.date)}</div>
-      </div>
-      <div class="log-meta">${l.sets}×${l.reps}${(l.loadLbs ?? null) !== null ? ` • ${escapeHtml(l.loadLbs)} lbs` : ""}</div>
-    </div>
-  `).join("");
+/* ==============================
+   Workout UI
+============================== */
+const workoutUI = createWorkoutUI({
+  dom: {
+    heatOverallBtn,
+    heatWorkoutBtn,
 
-  logsBox.innerHTML = out || `<div class="muted">No logs yet.</div>`;
+    startWorkoutBtn,
+    endWorkoutBtn,
+
+    workTitle,
+    timerText,
+    statusText,
+
+    workControls,
+    exerciseSelect,
+    addExerciseBtn,
+
+    workoutEditor,
+    editorFooter,
+    discardEditBtn,
+    saveEditBtn,
+
+    historyBox,
+    prevPageBtn,
+    nextPageBtn,
+    pageHint,
+
+    // allow workout_ui to read heat mode for button UI syncing
+    getHeatMode: () => heat.getMode(),
+  },
+
+  apiJson,
+  getExerciseById: async (id) => {
+    // lazy import use (keeps workout_ui small)
+    const mod = await import("./lib/exercises.js");
+    return mod.getExerciseById(id);
+  },
+  computeStimulusSingleSet,
+
+  onEditorSetsChanged: (sets) => {
+    heat.setWorkoutSets(sets);
+  },
+
+  onHeatAvailabilityChanged: ({ canWorkoutHeat }) => {
+    // if workout heat is impossible, force overall mode
+    if (!canWorkoutHeat && heat.getMode() === "workout") {
+      setHeatMode("overall");
+    }
+  },
+});
+
+/* ==============================
+   Heat mode UI + rebuild
+============================== */
+function setHeatButtons() {
+  const mode = heat.getMode();
+  if (heatOverallBtn) heatOverallBtn.classList.toggle("on", mode === "overall");
+  if (heatWorkoutBtn) heatWorkoutBtn.classList.toggle("on", mode === "workout");
+
+  const canWorkoutHeat = workoutUI.canWorkoutHeat();
+  if (heatWorkoutBtn) heatWorkoutBtn.disabled = !canWorkoutHeat;
 }
 
-/* ----------------------------- Workout logging ----------------------------- */
-function todayISO() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+async function rebuildHeatAndPaint() {
+  const state = await heat.rebuildNow();
+  renderer3d.applyHeatToAllMeshes(state, Date.now());
+  renderRecsFromState(state, Date.now());
 }
 
-async function renderExerciseOptions() {
-  exerciseSelect.innerHTML = "";
-
-  const list = await getAllExercisesCached();
-
-  // build a fast lookup for fallback (older logs without muscles_json)
-  exerciseWeightsById = {};
-  for (const ex of list) {
-    exerciseWeightsById[ex.id] = ex.w || {};
-  }
-
-  for (const ex of list) {
-    const opt = document.createElement("option");
-    opt.value = ex.id;
-    opt.textContent = ex.name;
-    exerciseSelect.appendChild(opt);
-  }
+function setHeatMode(mode) {
+  heat.setMode(mode);
+  setHeatButtons();
+  rebuildHeatAndPaint().catch((e) => console.warn("[heat] rebuild failed:", e));
 }
 
-function computeStimulus(sets, reps, loadLbs) {
-  const vol = Math.max(1, sets * reps);
+// Heat mode toggles
+if (heatOverallBtn) heatOverallBtn.addEventListener("click", () => setHeatMode("overall"));
+if (heatWorkoutBtn) heatWorkoutBtn.addEventListener("click", () => setHeatMode("workout"));
 
-  let loadFactor = 1.0;
-  if (Number.isFinite(loadLbs) && loadLbs > 0) {
-    loadFactor = 1.0 + Math.min(1.0, loadLbs / 200);
-  }
-
-  const base = (vol / 60) * loadFactor;
-  return clamp01(base);
-}
-
-async function onLogWorkout(ev) {
-  ev.preventDefault();
-
-  const date = (dateInput?.value || todayISO()).trim();
-  const exId = exerciseSelect.value;
-  const ex = await getExerciseById(exId);
-  if (!ex) return;
-
-  const sets = Math.max(1, parseInt(setsInput.value || "1", 10));
-  const reps = Math.max(1, parseInt(repsInput.value || "1", 10));
-  const loadLbsRaw = loadInput.value.trim();
-  const loadLbs = loadLbsRaw === "" ? null : Math.max(0, parseFloat(loadLbsRaw));
-
-  const stim = computeStimulus(sets, reps, loadLbs);
-
-  // snapshot muscles map
-  const muscles = {};
-  for (const [gid, w] of Object.entries(ex.w || {})) {
-    if (!Number.isFinite(w)) continue;
-    muscles[gid] = w;
-  }
-
-  await apiJson(API_WORKOUT_LOG, {
-    method: "POST",
-    body: JSON.stringify({
-      date,
-      exercise_id: ex.id,
-      exercise_name: ex.name,
-      sets,
-      reps,
-      load_lbs: loadLbs,
-      stimulus: stim,
-      muscles
-    }),
-  });
-
-  await loadLogsServer();
-  rebuildMuscleFromLogs(Date.now());
-
-  renderLogs();
-  renderRecs();
-  applyHeatToAllMeshes();
-
-  if (dateInput && !dateInput.value) dateInput.value = todayISO();
-}
-
-async function resetStateServer() {
-  try {
-    const res = await fetch(API_STATE_RESET, {
-      method: "POST",
-      cache: "no-store",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }
-    });
-
-    const text = await res.text();
-    const json = JSON.parse(text);
-
-    return json && json.ok === true;
-  } catch (e) {
-    console.warn("[reset] failed:", e);
-    return false;
-  }
-}
-
-function makeDefaultState() {
-  return {
-    logs: [],
-    muscle: {},
-    lastUpdate: Date.now(),
-  };
-}
-
-/* ----------------------------- UI wiring ----------------------------- */
-if (logForm) logForm.addEventListener("submit", onLogWorkout);
-
+/* ==============================
+   Recs button
+============================== */
 if (recsBtn) {
   recsBtn.addEventListener("click", async () => {
-    rebuildMuscleFromLogs(Date.now());
-    renderRecs();
-    applyHeatToAllMeshes();
+    try {
+      await rebuildHeatAndPaint();
+    } catch (e) {
+      console.warn("[recs] rebuild failed:", e);
+      const st = heat.getState();
+      renderer3d.applyHeatToAllMeshes(st, Date.now());
+      renderRecsFromState(st, Date.now());
+    }
   });
 }
 
+/* ==============================
+   Reset button (server wipe)
+============================== */
 if (resetBtn) {
   resetBtn.addEventListener("click", async () => {
     if (!confirm("Reset ALL MuscleMap data? This wipes the shared database.")) return;
@@ -1185,36 +570,56 @@ if (resetBtn) {
       return;
     }
 
-    state = makeDefaultState();
+    // clear local state
+    heat.clearAllLocalState();
+    renderer3d.clearSelected();
+    setSelectedPanel({ name: "None", groups: [] });
 
-    clearSelected();
-    renderLogs();
-    renderRecs();
-    applyHeatToAllMeshes();
+    // refresh workout UI (will show no workout)
+    await workoutUI.boot().catch(() => {});
+    setHeatMode("overall");
 
     alert("All data reset.");
   });
 }
 
-/* ----------------------------- Resize ----------------------------- */
+/* ==============================
+   Resize
+============================== */
 window.addEventListener("resize", () => {
-  renderer.setSize(mount.clientWidth, mount.clientHeight);
-  camera.aspect = mount.clientWidth / mount.clientHeight;
-  camera.updateProjectionMatrix();
+  renderer3d.resize();
 });
 
-/* ----------------------------- Boot ----------------------------- */
+/* ==============================
+   Boot
+============================== */
 async function boot() {
-  await loadLogsServer();
-  await renderExerciseOptions();
+  // exercises list (for select + optional fallback weights)
+  try {
+    const list = await getAllExercisesCached();
+    const map = {};
+    for (const ex of list) map[ex.id] = ex.w || {};
+    heat.setExerciseWeightsById(map);
+  } catch (e) {
+    console.warn("[boot] exercises load failed:", e);
+  }
 
-  if (dateInput) dateInput.value = todayISO();
+  await workoutUI.boot();
+  setHeatButtons();
 
-  rebuildMuscleFromLogs(Date.now());
-  renderLogs();
-  renderRecs();
+  // initial heat build
+  try {
+    await rebuildHeatAndPaint();
+  } catch (e) {
+    console.warn("[boot] heat build failed:", e);
+  }
 
-  loadGLBWithFallback().catch((e) => {
+  // model
+  renderer3d.loadGLBWithFallback().then(() => {
+    // repaint after model loads
+    const st = heat.getState();
+    renderer3d.applyHeatToAllMeshes(st, Date.now());
+  }).catch((e) => {
     console.error(e);
     alert("Model load failed.");
   });
@@ -1222,23 +627,47 @@ async function boot() {
 
 boot();
 
-/* ----------------------------- Loop ----------------------------- */
-let lastRebuildAt = Date.now();
+/* ==============================
+   Loop
+============================== */
+let lastHeatRebuildAt = Date.now();
+let lastStatusPollAt = Date.now();
 
 function animate() {
   requestAnimationFrame(animate);
 
   const now = Date.now();
-  if (now - lastRebuildAt > 2000) {
-    lastRebuildAt = now;
-    rebuildMuscleFromLogs(now);
-    applyHeatToAllMeshes(now);
-    renderRecs();
+
+  workoutUI.tickTimer(now);
+
+  // periodically refresh heat visuals/recs (no network; uses current state.logs)
+  if (now - lastHeatRebuildAt > 2000) {
+    lastHeatRebuildAt = now;
+    const st = heat.tick(now);
+    renderer3d.applyHeatToAllMeshes(st, now);
+    renderRecsFromState(st, now);
   }
 
-  controls.update();
-  renderer.render(scene, camera);
+  // poll status occasionally so autoclose / other-tab changes reflect
+  if (now - lastStatusPollAt > 15000) {
+    lastStatusPollAt = now;
+
+    workoutUI.refreshStatus()
+      .then(() => {
+        // if active workout disappeared while not editing a past workout, refresh view
+        if (!workoutUI.getViewingWorkoutId() && !workoutUI.getActiveWorkout() && heat.getMode() === "workout") {
+          setHeatMode("overall");
+        }
+
+        workoutUI.setWorkoutHeaderUI();
+        setHeatButtons();
+      })
+      .catch(() => {});
+  }
+
+  renderer3d.renderFrame();
 }
+
 animate();
 
 ################################################################################

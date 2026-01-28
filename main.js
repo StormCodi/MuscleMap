@@ -1,37 +1,28 @@
 // main.js
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-
-import { getAllExercisesCached, getExerciseById } from "./lib/exercises.js";
+import { getAllExercisesCached } from "./lib/exercises.js";
 import { classifyMeshName } from "./lib/muscleMap.js";
 import { computeHeat } from "./lib/recovery.js";
 import { generateRecs } from "./lib/recs.js";
 
-/* ==============================
-   API endpoints (new workout system)
-============================== */
-const API_WORKOUT_STATUS      = "./api/workout/status.php";
-const API_WORKOUT_START       = "./api/workout/start.php";
-const API_WORKOUT_END         = "./api/workout/end.php";
-const API_WORKOUT_GET_CURRENT = "./api/workout/get_current.php";
-const API_WORKOUT_ADD_SET     = "./api/workout/add_set.php";
-const API_WORKOUT_UPDATE_SET  = "./api/workout/update_set.php";
-const API_WORKOUT_DELETE_SET  = "./api/workout/delete_set.php";
-const API_WORKOUT_GET_ONE     = "./api/workout/get_workout.php";
-const API_WORKOUT_LIST        = "./api/workout/list_workouts.php";
-
-// legacy reset (shared DB wipe)
-const API_STATE_RESET         = "./api/state_reset.php";
+import { API, apiJson, resetStateServer } from "./lib/api.js";
+import { createHeatEngine } from "./lib/heat_engine.js";
+import { createRenderer3D } from "./lib/renderer3d.js";
+import { createWorkoutUI } from "./lib/workout_ui.js";
 
 /* ==============================
-   DOM refs (new mobile-first UI)
+   DOM refs
 ============================== */
 const mount = document.getElementById("view");
 if (!mount) throw new Error("Missing #view element");
 
 const heatOverallBtn = document.getElementById("heatOverallBtn");
 const heatWorkoutBtn = document.getElementById("heatWorkoutBtn");
+
+const selectedBox = document.getElementById("selectedBox");
+
+const recsBox = document.getElementById("recsBox");
+const recsBtn = document.getElementById("recsBtn");
+const resetBtn = document.getElementById("resetBtn");
 
 const startWorkoutBtn = document.getElementById("startWorkoutBtn");
 const endWorkoutBtn = document.getElementById("endWorkoutBtn");
@@ -49,113 +40,18 @@ const editorFooter = document.getElementById("editorFooter");
 const discardEditBtn = document.getElementById("discardEditBtn");
 const saveEditBtn = document.getElementById("saveEditBtn");
 
-const selectedBox = document.getElementById("selectedBox");
-
-const recsBox = document.getElementById("recsBox");
-const recsBtn = document.getElementById("recsBtn");
-const resetBtn = document.getElementById("resetBtn");
-
 const historyBox = document.getElementById("historyBox");
 const prevPageBtn = document.getElementById("prevPageBtn");
 const nextPageBtn = document.getElementById("nextPageBtn");
 const pageHint = document.getElementById("pageHint");
 
 /* ==============================
-   State
-============================== */
-let heatMode = "overall"; // "overall" | "workout"
-
-let state = {
-  logs: [],    // currently used for heat (depends on heatMode + view)
-  muscle: {},
-  lastUpdate: Date.now(),
-};
-
-let exerciseWeightsById = {}; // { exerciseId: {gid: weight} }
-
-let activeWorkout = null;      // {id, started_at, ...} or null
-let viewingWorkoutId = null;   // null => live workout view; else editing past workout
-let viewingSets = [];          // sets for current editor view (active or past workout)
-
-let historyPage = 1;
-let historyPages = 1;
-const HISTORY_PER_PAGE = 5;
-
-// When viewing past workout, we only allow editing/deleting existing sets (no adding new)
-const pending = {
-  dirty: false,
-  updatesBySetId: new Map(), // setId -> {reps?, load_lbs?}
-  deletes: new Set(),        // setId
-};
-
-let workoutTimerStartedAtMs = 0;
-
-// overall cache to avoid hammering DB every tick
-let overallCache = {
-  lastBuiltAt: 0,
-  logs: [],
-  maxWorkouts: 40,        // cap requests: 40 workouts x get_workout
-  maxAgeMs: 2 * 60 * 1000 // rebuild overall at most every 2 minutes
-};
-
-/* ==============================
-   API helper
-============================== */
-async function apiJson(url, opts = {}) {
-  const res = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...opts,
-    headers: {
-      ...(opts.headers || {}),
-      "Content-Type": "application/json",
-    },
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`API ${url} returned non-JSON:\n${text.slice(0, 500)}`);
-  }
-
-  if (!res.ok || data?.ok === false) {
-    throw new Error(data?.error || `HTTP ${res.status} from ${url}`);
-  }
-  return data;
-}
-
-/* ==============================
-   Utils
+   Small utils kept here
 ============================== */
 function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
-function hours(ms) {
-  return ms / (1000 * 60 * 60);
-}
-function parseSqlDateTime(s) {
-  // "YYYY-MM-DD HH:MM:SS" -> Date
-  if (!s) return null;
-  const iso = String(s).replace(" ", "T");
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-function fmtElapsed(ms) {
-  if (!(ms >= 0)) return "—";
-  const s = Math.floor(ms / 1000);
-  const hh = Math.floor(s / 3600);
-  const mm = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  if (hh > 0) return `${hh}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
-  return `${mm}:${String(ss).padStart(2,"0")}`;
-}
-function prettyGroupId(id) {
-  return (id || "")
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -166,1105 +62,173 @@ function escapeHtml(s) {
   }[c]));
 }
 
-/* ==============================
-   Heat / muscle rebuild from state.logs
-============================== */
-function rebuildMuscleFromLogs(now = Date.now()) {
-  const muscle = {};
-  const halfLifeHrs = 36;
-
-  const ensure = (gid) => {
-    if (!muscle[gid]) muscle[gid] = { load: 0, lastTrained: 0, lastPing: 0 };
-    return muscle[gid];
-  };
-
-  for (const l of state.logs) {
-    const dt = parseSqlDateTime(l.createdAt);
-    if (!dt) continue;
-    const tMs = dt.getTime();
-
-    const ageMs = now - tMs;
-    const decay = Math.pow(0.5, hours(ageMs) / halfLifeHrs);
-
-    const wmap =
-      (l.muscles && typeof l.muscles === "object")
-        ? l.muscles
-        : (exerciseWeightsById[l.exerciseId] || null);
-
-    if (!wmap) continue;
-
-    const stim = Number(l.stimulus) || 0;
-    if (!(stim > 0)) continue;
-
-    for (const [gidRaw, wRaw] of Object.entries(wmap)) {
-      const gid = String(gidRaw || "").trim();
-      const w = Number(wRaw);
-      if (!gid || !Number.isFinite(w) || w <= 0) continue;
-
-      const m = ensure(gid);
-      const add = stim * w * decay;
-      if (!(add > 0)) continue;
-
-      m.load = clamp01(m.load + add);
-      m.lastTrained = Math.max(m.lastTrained, tMs);
-    }
-  }
-
-  state.muscle = muscle;
-  state.lastUpdate = now;
+function prettyGroupId(id) {
+  return (id || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function heatToVisual(heat, overdo) {
-  const h = clamp01(heat);
-
-  let color = new THREE.Color(0x7a7a7a);
-  let emissive = new THREE.Color(0x000000);
-  let eI = 0.0;
-
-  if (overdo) {
-    color = new THREE.Color(0xff3c3c);
-    emissive = new THREE.Color(0xff3c3c);
-    eI = 1.25;
-    return { color, emissive, emissiveIntensity: eI };
-  }
-
-  if (h < 0.12) return { color, emissive, emissiveIntensity: eI };
-
-  if (h < 0.35) emissive = new THREE.Color(0x3cff7a);
-  else if (h < 0.6) emissive = new THREE.Color(0xffd84d);
-  else emissive = new THREE.Color(0xff9b3c);
-
-  return { color, emissive, emissiveIntensity: 0.8 };
-}
-
-/* ==============================
-   Three.js setup
-============================== */
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.setSize(mount.clientWidth, mount.clientHeight);
-renderer.setClearColor(0x0b0b0c, 1);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-mount.appendChild(renderer.domElement);
-
-const scene = new THREE.Scene();
-
-const camera = new THREE.PerspectiveCamera(
-  45,
-  mount.clientWidth / mount.clientHeight,
-  0.01,
-  5000
-);
-camera.position.set(0, 160, 380);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.target.set(0, 120, 0);
-
-// lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x202020, 0.55));
-const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-dir.position.set(250, 450, 250);
-scene.add(dir);
-
-// grid
-const grid = new THREE.GridHelper(800, 40, 0x2a2a2a, 0x181818);
-grid.position.y = 0;
-scene.add(grid);
-
-// model bookkeeping
-let currentModel = null;
-const skinShellMeshes = [];
-const gymMeshes = [];
-const pickables = [];
-let selectedMesh = null;
-
-function makeBaselineMuscleMaterial() {
-  return new THREE.MeshStandardMaterial({
-    color: 0x7a7a7a,
-    roughness: 0.88,
-    metalness: 0.0,
-    emissive: new THREE.Color(0x000000),
-    emissiveIntensity: 0.0,
-  });
-}
-function makeSkinMaterial() {
-  return new THREE.MeshStandardMaterial({
-    color: 0x8e8e94,
-    roughness: 0.95,
-    metalness: 0.0,
-    transparent: true,
-    opacity: 0.32,
-    emissive: new THREE.Color(0x000000),
-    emissiveIntensity: 0.0,
-    depthWrite: false,
-  });
-}
-function applySelectionLook(mesh) {
-  if (!mesh?.material) return;
-  mesh.material.emissive = new THREE.Color(0x18a944);
-  mesh.material.emissiveIntensity = 1.15;
-  mesh.material.color = new THREE.Color(0x3cff7a);
-  mesh.material.wireframe = true;
-  mesh.material.needsUpdate = true;
-}
-function clearSelectionLook(mesh) {
-  if (!mesh?.material) return;
-  mesh.material.wireframe = false;
-  mesh.material.needsUpdate = true;
-}
-
-function frameObject(obj) {
-  const box = new THREE.Box3().setFromObject(obj);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-
-  controls.target.copy(center);
-
-  const maxDim = Math.max(size.x, size.y, size.z);
-  const dist = maxDim * 1.25;
-
-  camera.position.set(center.x, center.y + maxDim * 0.15, center.z + dist);
-  camera.near = Math.max(0.01, maxDim / 1000);
-  camera.far = maxDim * 20;
-  camera.updateProjectionMatrix();
-}
-
-function clearModel() {
-  if (currentModel) scene.remove(currentModel);
-  currentModel = null;
-  skinShellMeshes.length = 0;
-  gymMeshes.length = 0;
-  pickables.length = 0;
-  selectedMesh = null;
-}
-
-async function loadGLBWithFallback() {
-  const candidates = ["./assets/models/body.glb", "./assets/models/body.draco.glb"];
-  for (const url of candidates) {
-    try {
-      await loadGLB(url);
-      return;
-    } catch (e) {
-      console.warn("[GLB] failed:", url, e?.message || e);
-    }
-  }
-  throw new Error("Could not load any model. Put body.glb in assets/models/.");
-}
-
-function loadGLB(url) {
-  clearModel();
-  const loader = new GLTFLoader();
-
-  return new Promise((resolve, reject) => {
-    loader.load(
-      url,
-      (gltf) => {
-        const model = gltf.scene;
-        currentModel = model;
-
-        model.scale.setScalar(1);
-        model.position.set(0, 0, 0);
-
-        applyClassification(model);
-        scene.add(model);
-        frameObject(model);
-
-        applyHeatToAllMeshes();
-        resolve();
-      },
-      undefined,
-      (err) => reject(err)
-    );
-  });
-}
-
-function applyClassification(root) {
-  const skinMat = makeSkinMaterial();
-
-  root.traverse((obj) => {
-    if (!obj.isMesh) return;
-
-    const info = classifyMeshName(obj.name);
-
-    if (info.kind === "shell") {
-      obj.material = skinMat;
-      obj.renderOrder = 2;
-      obj.frustumCulled = true;
-      obj.visible = true;
-      skinShellMeshes.push(obj);
-      return;
-    }
-
-    if (info.kind === "gym") {
-      obj.visible = true;
-      obj.renderOrder = 1;
-      obj.frustumCulled = true;
-
-      const base = makeBaselineMuscleMaterial();
-      obj.material = base;
-      obj.userData._muscle = { groups: info.groups || [], baseMaterial: base };
-
-      gymMeshes.push({ mesh: obj, groups: obj.userData._muscle.groups });
-      pickables.push(obj);
-      return;
-    }
-
-    obj.visible = false;
-  });
-}
-
-/* ==============================
-   Picking + Selected panel
-============================== */
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-let downAt = null;
-
-function getPointerNDC(ev) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.set(
-    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
-    -(((ev.clientY - rect.top) / rect.height) * 2 - 1)
-  );
-}
-
-renderer.domElement.addEventListener("pointerdown", (ev) => {
-  downAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
-});
-
-renderer.domElement.addEventListener("pointerup", (ev) => {
-  if (!downAt) return;
-  const dx = Math.abs(ev.clientX - downAt.x);
-  const dy = Math.abs(ev.clientY - downAt.y);
-  const dt = performance.now() - downAt.t;
-  downAt = null;
-  if (dx > 6 || dy > 6 || dt > 500) return;
-
-  getPointerNDC(ev);
-  raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(pickables, true);
-  if (!hits.length) return clearSelected();
-  setSelected(hits[0].object);
-});
-
-function setSelected(mesh) {
-  if (selectedMesh === mesh) return clearSelected();
-  clearSelected();
-  selectedMesh = mesh;
-
-  applyHeatToMesh(mesh);
-  applySelectionLook(mesh);
-
-  const groups = mesh.userData?._muscle?.groups || [];
-  selectedBox.querySelector(".selected-name").textContent = mesh.name || "(unnamed)";
-  selectedBox.querySelector(".selected-meta").textContent =
-    groups.length ? groups.map(prettyGroupId).join(", ") : "Unknown";
-}
-
-function clearSelected() {
-  if (!selectedMesh) return;
-  clearSelectionLook(selectedMesh);
-  applyHeatToMesh(selectedMesh);
-  selectedMesh = null;
-  selectedBox.querySelector(".selected-name").textContent = "None";
-  selectedBox.querySelector(".selected-meta").textContent = "Tap a muscle.";
-}
-
-/* ==============================
-   Apply heat to meshes
-============================== */
-function applyHeatToMesh(mesh, now = Date.now()) {
-  const groups = mesh.userData?._muscle?.groups || [];
-  let maxHeat = 0;
-  let overdo = false;
-
-  for (const g of groups) {
-    const h = computeHeat(state, g, now);
-    maxHeat = Math.max(maxHeat, h.heat);
-    if (h.overdo) overdo = true;
-  }
-
-  const v = heatToVisual(maxHeat, overdo);
-  mesh.material.color = v.color;
-  mesh.material.emissive = v.emissive;
-  mesh.material.emissiveIntensity = v.emissiveIntensity;
-  mesh.material.wireframe = false;
-}
-
-function applyHeatToAllMeshes(now = Date.now()) {
-  for (const { mesh } of gymMeshes) applyHeatToMesh(mesh, now);
-  if (selectedMesh) applySelectionLook(selectedMesh);
-}
-
-/* ==============================
-   Exercises
-============================== */
-async function renderExerciseOptions() {
-  if (!exerciseSelect) return;
-  exerciseSelect.innerHTML = "";
-
-  const list = await getAllExercisesCached();
-
-  // build fallback weights
-  exerciseWeightsById = {};
-  for (const ex of list) exerciseWeightsById[ex.id] = ex.w || {};
-
-  for (const ex of list) {
-    const opt = document.createElement("option");
-    opt.value = ex.id;
-    opt.textContent = ex.name;
-    exerciseSelect.appendChild(opt);
-  }
-}
-
+// per-set stimulus formula (same as your old one, just isolated)
 function computeStimulusSingleSet(reps, loadLbs) {
-  // you can change this later; this is a per-set version of your old formula.
   const vol = Math.max(1, reps);
   let loadFactor = 1.0;
   if (Number.isFinite(loadLbs) && loadLbs > 0) {
     loadFactor = 1.0 + Math.min(1.0, loadLbs / 200);
   }
-  const base = (vol / 12) * loadFactor; // ~12 reps baseline
+  const base = (vol / 12) * loadFactor;
   return clamp01(base);
 }
 
 /* ==============================
-   Workout API loaders
+   Heat engine
 ============================== */
-async function refreshStatus() {
-  const data = await apiJson(API_WORKOUT_STATUS, { method: "GET" });
-  activeWorkout = data.active || null;
+const heat = createHeatEngine({
+  apiJson,
+  API,
+  historyPerPage: 5,
+  maxWorkouts: 40,
+  maxAgeMs: 2 * 60 * 1000,
+});
 
-  if (activeWorkout?.started_at) {
-    const d = parseSqlDateTime(activeWorkout.started_at);
-    workoutTimerStartedAtMs = d ? d.getTime() : 0;
-  } else {
-    workoutTimerStartedAtMs = 0;
-  }
-}
-
-function setControlsEnabled(enabled) {
-  if (!workControls) return;
-  if (enabled) workControls.classList.remove("disabled");
-  else workControls.classList.add("disabled");
-}
-
-function setHeatButtons() {
-  if (heatOverallBtn) heatOverallBtn.classList.toggle("on", heatMode === "overall");
-  if (heatWorkoutBtn) heatWorkoutBtn.classList.toggle("on", heatMode === "workout");
-
-  // workout heat only makes sense if you have something to show (active OR viewing a workout)
-  const canWorkoutHeat = Boolean(activeWorkout) || Boolean(viewingWorkoutId);
-  if (heatWorkoutBtn) heatWorkoutBtn.disabled = !canWorkoutHeat;
-  if (!canWorkoutHeat && heatMode === "workout") heatMode = "overall";
-}
-
-function setWorkoutHeaderUI() {
-  const isEditingPast = Boolean(viewingWorkoutId);
-
-  if (isEditingPast) {
-    if (workTitle) workTitle.textContent = "Workout (edit past)";
-    if (statusText) statusText.textContent = `Editing workout #${viewingWorkoutId}`;
-    if (timerText) timerText.textContent = "—";
-    if (startWorkoutBtn) startWorkoutBtn.disabled = true;
-    if (endWorkoutBtn) endWorkoutBtn.disabled = true;
-    setControlsEnabled(false);
-    if (editorFooter) editorFooter.classList.remove("hidden");
-  } else {
-    if (editorFooter) editorFooter.classList.add("hidden");
-
-    if (!activeWorkout) {
-      if (workTitle) workTitle.textContent = "Workout";
-      if (statusText) statusText.textContent = "No workout";
-      if (timerText) timerText.textContent = "—";
-      if (startWorkoutBtn) startWorkoutBtn.disabled = false;
-      if (endWorkoutBtn) endWorkoutBtn.disabled = true;
-      setControlsEnabled(false);
-    } else {
-      if (workTitle) workTitle.textContent = "Workout (live)";
-      if (statusText) statusText.textContent = "In progress";
-      if (startWorkoutBtn) startWorkoutBtn.disabled = true;
-      if (endWorkoutBtn) endWorkoutBtn.disabled = false;
-      setControlsEnabled(true);
-    }
-  }
-
-  setHeatButtons();
+/* ==============================
+   Selected panel UI
+============================== */
+function setSelectedPanel({ name, groups }) {
+  if (!selectedBox) return;
+  const nameEl = selectedBox.querySelector(".selected-name");
+  const metaEl = selectedBox.querySelector(".selected-meta");
+  if (nameEl) nameEl.textContent = name || "None";
+  if (metaEl) metaEl.textContent = (groups && groups.length)
+    ? groups.map(prettyGroupId).join(", ")
+    : "Tap a muscle.";
 }
 
 /* ==============================
-   Build logs for heat (overall/workout)
+   Renderer
 ============================== */
-function setStateLogsForHeat(logs) {
-  state.logs = logs;
-  rebuildMuscleFromLogs(Date.now());
-  applyHeatToAllMeshes(Date.now());
-  renderRecs();
-}
-
-function setHeatMode(mode) {
-  heatMode = mode === "workout" ? "workout" : "overall";
-  setHeatButtons();
-  rebuildHeatNow().catch((e) => console.warn("[heat] rebuild failed:", e));
-}
-
-async function rebuildHeatNow() {
-  if (heatMode === "workout") {
-    // workout heat should reflect what's currently shown in editor:
-    // - if editing past workout: use viewingSets
-    // - else if active: use current workout sets
-    const logs = setsToHeatLogs(viewingSets);
-    setStateLogsForHeat(logs);
-    return;
-  }
-
-  // overall heat: cached build of logs across recent workouts
-  const now = Date.now();
-  if (overallCache.logs.length && (now - overallCache.lastBuiltAt) < overallCache.maxAgeMs) {
-    setStateLogsForHeat(overallCache.logs);
-    return;
-  }
-
-  const logs = await buildOverallLogsCapped();
-  overallCache.logs = logs;
-  overallCache.lastBuiltAt = now;
-
-  setStateLogsForHeat(logs);
-}
-
-function setsToHeatLogs(sets) {
-  // transform workout_sets rows into the old "log" shape the heat pipeline expects
-  return (sets || []).map((s) => ({
-    id: String(s.id),
-    date: "", // not needed
-    exerciseId: String(s.exercise_id),
-    exerciseName: String(s.exercise_name),
-    sets: 1,
-    reps: Number(s.reps),
-    loadLbs: s.load_lbs === null || s.load_lbs === undefined ? null : Number(s.load_lbs),
-    stimulus: Number(s.stimulus),
-    createdAt: String(s.created_at || ""),
-    muscles: (s.muscles && typeof s.muscles === "object") ? s.muscles : null,
-  }));
-}
-
-async function buildOverallLogsCapped() {
-  // Pull most recent workouts (paged), then fetch each workout's sets.
-  // This is intentionally capped so it doesn't DDoS your server.
-  const logs = [];
-  let page = 1;
-  let fetchedWorkouts = 0;
-
-  while (true) {
-    const list = await apiJson(`${API_WORKOUT_LIST}?page=${page}&per=${HISTORY_PER_PAGE}`, { method: "GET" });
-    const workouts = Array.isArray(list.workouts) ? list.workouts : [];
-    if (!workouts.length) break;
-
-    for (const w of workouts) {
-      if (fetchedWorkouts >= overallCache.maxWorkouts) break;
-      const wid = Number(w.id);
-      if (!wid) continue;
-
-      const data = await apiJson(`${API_WORKOUT_GET_ONE}?id=${wid}`, { method: "GET" });
-      const sets = Array.isArray(data.sets) ? data.sets : [];
-      for (const s of sets) logs.push({
-        id: String(s.id),
-        date: "",
-        exerciseId: String(s.exercise_id),
-        exerciseName: String(s.exercise_name),
-        sets: 1,
-        reps: Number(s.reps),
-        loadLbs: s.load_lbs === null || s.load_lbs === undefined ? null : Number(s.load_lbs),
-        stimulus: Number(s.stimulus),
-        createdAt: String(s.created_at || ""),
-        muscles: (s.muscles && typeof s.muscles === "object") ? s.muscles : null,
-      });
-
-      fetchedWorkouts++;
-    }
-
-    if (fetchedWorkouts >= overallCache.maxWorkouts) break;
-
-    page++;
-    if (page > (Number(list.pages) || 1)) break;
-  }
-
-  return logs;
-}
+const renderer3d = createRenderer3D({
+  mount,
+  classifyMeshName,
+  computeHeat,
+  onSelect: ({ name, groups }) => {
+    setSelectedPanel({ name: name || "None", groups: groups || [] });
+  },
+});
 
 /* ==============================
-   Recommendations (based on current heat state)
+   Recs render
 ============================== */
-function renderRecs() {
+function renderRecsFromState(state, now = Date.now()) {
   if (!recsBox) return;
 
-  const groupSet = new Set();
-  for (const { groups } of gymMeshes) for (const g of groups) groupSet.add(g);
+  const groupIds = renderer3d.getAllGroupIds();
+  const recs = generateRecs(state, groupIds, now);
 
-  const recs = generateRecs(state, [...groupSet], Date.now());
   recsBox.innerHTML = recs.length
     ? recs.map((r) => `<div class="rec">${escapeHtml(r.text)}</div>`).join("")
     : `<div class="muted">Looking balanced. Keep it up.</div>`;
 }
 
 /* ==============================
-   Workout editor rendering + actions
+   Workout UI
 ============================== */
-function clearPending() {
-  pending.dirty = false;
-  pending.updatesBySetId.clear();
-  pending.deletes.clear();
-  updateSaveFooterState();
-}
+const workoutUI = createWorkoutUI({
+  dom: {
+    heatOverallBtn,
+    heatWorkoutBtn,
 
-function updateSaveFooterState() {
-  if (!editorFooter) return;
-  if (!viewingWorkoutId) {
-    editorFooter.classList.add("hidden");
-    return;
-  }
-  editorFooter.classList.remove("hidden");
-  if (saveEditBtn) saveEditBtn.disabled = !pending.dirty;
-}
+    startWorkoutBtn,
+    endWorkoutBtn,
 
-function groupSetsByExercise(sets) {
-  const map = new Map(); // exId -> {exercise_id, exercise_name, sets:[]}
-  for (const s of sets) {
-    const exId = String(s.exercise_id);
-    if (!map.has(exId)) {
-      map.set(exId, {
-        exercise_id: exId,
-        exercise_name: String(s.exercise_name || exId),
-        sets: []
-      });
+    workTitle,
+    timerText,
+    statusText,
+
+    workControls,
+    exerciseSelect,
+    addExerciseBtn,
+
+    workoutEditor,
+    editorFooter,
+    discardEditBtn,
+    saveEditBtn,
+
+    historyBox,
+    prevPageBtn,
+    nextPageBtn,
+    pageHint,
+
+    // allow workout_ui to read heat mode for button UI syncing
+    getHeatMode: () => heat.getMode(),
+  },
+
+  apiJson,
+  getExerciseById: async (id) => {
+    // lazy import use (keeps workout_ui small)
+    const mod = await import("./lib/exercises.js");
+    return mod.getExerciseById(id);
+  },
+  computeStimulusSingleSet,
+
+  onEditorSetsChanged: (sets) => {
+    heat.setWorkoutSets(sets);
+  },
+
+  onHeatAvailabilityChanged: ({ canWorkoutHeat }) => {
+    // if workout heat is impossible, force overall mode
+    if (!canWorkoutHeat && heat.getMode() === "workout") {
+      setHeatMode("overall");
     }
-    map.get(exId).sets.push(s);
-  }
-  return [...map.values()];
+  },
+});
+
+/* ==============================
+   Heat mode UI + rebuild
+============================== */
+function setHeatButtons() {
+  const mode = heat.getMode();
+  if (heatOverallBtn) heatOverallBtn.classList.toggle("on", mode === "overall");
+  if (heatWorkoutBtn) heatWorkoutBtn.classList.toggle("on", mode === "workout");
+
+  const canWorkoutHeat = workoutUI.canWorkoutHeat();
+  if (heatWorkoutBtn) heatWorkoutBtn.disabled = !canWorkoutHeat;
 }
 
-function renderWorkoutEditor() {
-  if (!workoutEditor) return;
-
-  if (!viewingSets.length) {
-    if (viewingWorkoutId) {
-      workoutEditor.innerHTML = `<div class="muted">No sets in this workout.</div>`;
-    } else if (!activeWorkout) {
-      workoutEditor.innerHTML = `<div class="muted">Start a workout to add exercises.</div>`;
-    } else {
-      workoutEditor.innerHTML = `<div class="muted">Add an exercise to begin.</div>`;
-    }
-    return;
-  }
-
-  const isEditingPast = Boolean(viewingWorkoutId);
-  const groups = groupSetsByExercise(viewingSets);
-
-  workoutEditor.innerHTML = groups.map((g) => {
-    const setsHtml = g.sets.map((s) => {
-      const disabled = isEditingPast ? "" : ""; // allow editing live too
-      const loadVal = (s.load_lbs === null || s.load_lbs === undefined) ? "" : String(s.load_lbs);
-
-      return `
-        <div class="setrow" data-setid="${escapeHtml(s.id)}">
-          <input class="repsInput" inputmode="numeric" ${disabled} value="${escapeHtml(s.reps)}" />
-          <input class="loadInput" inputmode="decimal" placeholder="lbs" ${disabled} value="${escapeHtml(loadVal)}" />
-          <button class="iconbtn bad delSetBtn" type="button" title="Delete set">×</button>
-        </div>
-      `;
-    }).join("");
-
-    return `
-      <div class="excard" data-exid="${escapeHtml(g.exercise_id)}">
-        <div class="excard-top">
-          <div>
-            <div class="ex-name">${escapeHtml(g.exercise_name)}</div>
-            <div class="ex-sub">${escapeHtml(g.exercise_id)}</div>
-          </div>
-        </div>
-        <div class="sets">
-          ${setsHtml}
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  wireEditorInteractions();
+async function rebuildHeatAndPaint() {
+  const state = await heat.rebuildNow();
+  renderer3d.applyHeatToAllMeshes(state, Date.now());
+  renderRecsFromState(state, Date.now());
 }
 
-function wireEditorInteractions() {
-  // reps/load edits mark pending (for past workout) or directly update (for live)
-  const rows = workoutEditor.querySelectorAll(".setrow");
-  rows.forEach((row) => {
-    const setId = Number(row.getAttribute("data-setid"));
-    if (!setId) return;
-
-    const repsEl = row.querySelector(".repsInput");
-    const loadEl = row.querySelector(".loadInput");
-    const delBtn = row.querySelector(".delSetBtn");
-
-    const onChange = async () => {
-      const reps = Math.max(1, parseInt(String(repsEl.value || "1"), 10));
-      const loadStr = String(loadEl.value || "").trim();
-      const load = loadStr === "" ? null : Math.max(0, Number(loadStr));
-
-      // update local copy immediately
-      const idx = viewingSets.findIndex((s) => Number(s.id) === setId);
-      if (idx >= 0) {
-        viewingSets[idx].reps = reps;
-        viewingSets[idx].load_lbs = load;
-        // stimulus should be updated too
-        const stim = computeStimulusSingleSet(reps, load);
-        viewingSets[idx].stimulus = stim;
-      }
-
-      // If editing past workout: stage changes until Save
-      if (viewingWorkoutId) {
-        pending.dirty = true;
-        pending.updatesBySetId.set(setId, { reps, load_lbs: load });
-        updateSaveFooterState();
-      } else {
-        // live: update immediately
-        const stim = computeStimulusSingleSet(reps, load);
-        await apiJson(API_WORKOUT_UPDATE_SET, {
-          method: "POST",
-          body: JSON.stringify({ set_id: setId, reps, load_lbs: load, stimulus: stim }),
-        });
-
-        // rebuild workout heat if needed
-        if (heatMode === "workout") await rebuildHeatNow();
-        await refreshHistory(); // counts/summary update
-      }
-    };
-
-    repsEl?.addEventListener("change", onChange);
-    loadEl?.addEventListener("change", onChange);
-
-    delBtn?.addEventListener("click", async () => {
-      if (!confirm("Delete this set?")) return;
-
-      // local remove
-      viewingSets = viewingSets.filter((s) => Number(s.id) !== setId);
-      renderWorkoutEditor();
-
-      if (viewingWorkoutId) {
-        pending.dirty = true;
-        pending.deletes.add(setId);
-        pending.updatesBySetId.delete(setId);
-        updateSaveFooterState();
-      } else {
-        await apiJson(API_WORKOUT_DELETE_SET, {
-          method: "POST",
-          body: JSON.stringify({ set_id: setId }),
-        });
-
-        if (heatMode === "workout") await rebuildHeatNow();
-        await refreshHistory();
-      }
-    });
-  });
-}
-
-async function addExerciseAsOneSet() {
-  if (!activeWorkout) return;
-
-  const exId = String(exerciseSelect.value || "").trim();
-  if (!exId) return;
-
-  const ex = await getExerciseById(exId);
-  if (!ex) return;
-
-  // default one set
-  const reps = 10;
-  const load = null;
-  const stim = computeStimulusSingleSet(reps, load);
-
-  const muscles = {};
-  for (const [gid, w] of Object.entries(ex.w || {})) {
-    const ww = Number(w);
-    if (!Number.isFinite(ww) || ww <= 0) continue;
-    muscles[gid] = ww;
-  }
-
-  const data = await apiJson(API_WORKOUT_ADD_SET, {
-    method: "POST",
-    body: JSON.stringify({
-      exercise_id: ex.id,
-      exercise_name: ex.name,
-      reps,
-      load_lbs: load,
-      stimulus: stim,
-      muscles,
-    }),
-  });
-
-  // reload current sets from server to keep canonical
-  await loadCurrentWorkoutSets();
-  await refreshHistory();
-
-  // workout heat should reflect it
-  if (heatMode === "workout") await rebuildHeatNow();
-  else {
-    // overall cache now stale
-    overallCache.lastBuiltAt = 0;
-  }
-}
-
-async function loadCurrentWorkoutSets() {
-  const data = await apiJson(API_WORKOUT_GET_CURRENT, { method: "GET" });
-
-  activeWorkout = data.active || null;
-  viewingWorkoutId = null;
-  clearPending();
-
-  viewingSets = Array.isArray(data.sets) ? data.sets.map(normalizeSetRow) : [];
-
-  // timer
-  if (activeWorkout?.started_at) {
-    const d = parseSqlDateTime(activeWorkout.started_at);
-    workoutTimerStartedAtMs = d ? d.getTime() : 0;
-  } else {
-    workoutTimerStartedAtMs = 0;
-  }
-
-  setWorkoutHeaderUI();
-  renderWorkoutEditor();
+function setHeatMode(mode) {
+  heat.setMode(mode);
   setHeatButtons();
-
-  // if we're in workout heat mode, rebuild heat from these sets
-  if (heatMode === "workout") await rebuildHeatNow();
+  rebuildHeatAndPaint().catch((e) => console.warn("[heat] rebuild failed:", e));
 }
-
-function normalizeSetRow(s) {
-  // ensure types consistent
-  return {
-    id: Number(s.id),
-    workout_id: Number(s.workout_id),
-    exercise_id: String(s.exercise_id),
-    exercise_name: String(s.exercise_name),
-    reps: Number(s.reps),
-    load_lbs: (s.load_lbs === null || s.load_lbs === undefined) ? null : Number(s.load_lbs),
-    stimulus: Number(s.stimulus),
-    muscles: (s.muscles && typeof s.muscles === "object") ? s.muscles : null,
-    created_at: String(s.created_at || ""),
-    updated_at: String(s.updated_at || ""),
-  };
-}
-
-async function viewWorkout(workoutId) {
-  const wid = Number(workoutId);
-  if (!wid) return;
-
-  const data = await apiJson(`${API_WORKOUT_GET_ONE}?id=${wid}`, { method: "GET" });
-
-  viewingWorkoutId = wid;
-  clearPending();
-
-  // freeze activeWorkout display but keep it in memory for history badge
-  viewingSets = Array.isArray(data.sets) ? data.sets.map(normalizeSetRow) : [];
-
-  setWorkoutHeaderUI();
-  renderWorkoutEditor();
-
-  // workout heat when viewing a past workout should work
-  if (heatMode === "workout") await rebuildHeatNow();
-  setHeatButtons();
-}
-
-async function exitPastWorkoutEdit() {
-  viewingWorkoutId = null;
-  clearPending();
-  await loadCurrentWorkoutSets(); // goes back to live view (or "no workout")
-}
-
-/* ==============================
-   History rendering + pagination
-============================== */
-function fmtWorkoutDate(s) {
-  const d = parseSqlDateTime(s);
-  if (!d) return String(s || "");
-  // local-ish short format
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
-}
-
-async function refreshHistory() {
-  const data = await apiJson(`${API_WORKOUT_LIST}?page=${historyPage}&per=${HISTORY_PER_PAGE}`, { method: "GET" });
-  const workouts = Array.isArray(data.workouts) ? data.workouts : [];
-
-  historyPages = Number(data.pages) || 1;
-  historyPage = Number(data.page) || 1;
-
-  if (prevPageBtn) prevPageBtn.disabled = historyPage <= 1;
-  if (nextPageBtn) nextPageBtn.disabled = historyPage >= historyPages;
-
-  if (pageHint) pageHint.textContent = historyPages > 1 ? `Page ${historyPage} / ${historyPages}` : "";
-
-  historyBox.innerHTML = workouts.map((w) => {
-    const isLive = activeWorkout && Number(activeWorkout.id) === Number(w.id);
-    const isViewing = viewingWorkoutId && Number(viewingWorkoutId) === Number(w.id);
-
-    const badge = isLive
-      ? `<span class="badge live">LIVE</span>`
-      : isViewing
-        ? `<span class="badge">EDITING</span>`
-        : "";
-
-    const sum = w.summary || {};
-    const setsCount = Number(sum.sets_count ?? 0);
-    const exCount = Number(sum.exercises_count ?? 0);
-
-    const meta = `${exCount} exercises • ${setsCount} sets`;
-
-    return `
-      <div class="workcard" data-wid="${escapeHtml(w.id)}">
-        <div class="workcard-top">
-          <div>
-            <div class="workcard-title">Workout #${escapeHtml(w.id)}</div>
-            <div class="workcard-meta">${escapeHtml(fmtWorkoutDate(w.started_at))}${w.ended_at ? ` → ${escapeHtml(fmtWorkoutDate(w.ended_at))}` : ""}</div>
-            <div class="workcard-meta">${escapeHtml(meta)}</div>
-          </div>
-          ${badge}
-        </div>
-      </div>
-    `;
-  }).join("") || `<div class="muted">No workouts yet.</div>`;
-
-  // click handlers
-  historyBox.querySelectorAll(".workcard").forEach((el) => {
-    el.addEventListener("click", async () => {
-      const wid = Number(el.getAttribute("data-wid"));
-      if (!wid) return;
-
-      // If clicking the same workout you're editing, do nothing
-      if (viewingWorkoutId && Number(viewingWorkoutId) === wid) return;
-
-      await viewWorkout(wid);
-      await refreshHistory(); // updates EDITING badge
-    });
-  });
-}
-
-/* ==============================
-   Start/End workout
-============================== */
-async function startWorkout() {
-  await apiJson(API_WORKOUT_START, { method: "POST" }).catch(async () => {
-    // start.php accepts GET too, but keep robust
-    return await apiJson(API_WORKOUT_START, { method: "GET" });
-  });
-
-  await loadCurrentWorkoutSets();
-  await refreshHistory();
-
-  // make workout heat available
-  setHeatButtons();
-}
-
-async function endWorkout() {
-  if (!activeWorkout) return;
-  if (!confirm("End workout?")) return;
-
-  await apiJson(API_WORKOUT_END, { method: "POST" }).catch(async () => {
-    return await apiJson(API_WORKOUT_END, { method: "GET" });
-  });
-
-  await refreshStatus();
-  await loadCurrentWorkoutSets();
-  await refreshHistory();
-
-  // overall cache stale
-  overallCache.lastBuiltAt = 0;
-
-  // If we were in workout heat, no active workout now -> fallback to overall
-  if (heatMode === "workout") setHeatMode("overall");
-}
-
-/* ==============================
-   Save / discard past workout edits
-============================== */
-async function savePastEdits() {
-  if (!viewingWorkoutId) return;
-  if (!pending.dirty) return;
-
-  if (!confirm("Save changes to this workout?")) return;
-
-  // deletes first
-  for (const setId of pending.deletes) {
-    await apiJson(API_WORKOUT_DELETE_SET, {
-      method: "POST",
-      body: JSON.stringify({ set_id: setId }),
-    });
-  }
-
-  // updates
-  for (const [setId, patch] of pending.updatesBySetId.entries()) {
-    const reps = Math.max(1, parseInt(String(patch.reps ?? 1), 10));
-    const load = (patch.load_lbs === null || patch.load_lbs === undefined) ? null : Math.max(0, Number(patch.load_lbs));
-
-    // also update stimulus so heat stays consistent
-    const stim = computeStimulusSingleSet(reps, load);
-
-    await apiJson(API_WORKOUT_UPDATE_SET, {
-      method: "POST",
-      body: JSON.stringify({ set_id: setId, reps, load_lbs: load, stimulus: stim }),
-    });
-  }
-
-  clearPending();
-
-  // reload workout view from server so it's canonical
-  await viewWorkout(viewingWorkoutId);
-  await refreshHistory();
-
-  // overall cache stale
-  overallCache.lastBuiltAt = 0;
-
-  // rebuild heat for current mode
-  await rebuildHeatNow();
-}
-
-/* ==============================
-   Reset (server wipe) — keep for now
-============================== */
-async function resetStateServer() {
-  try {
-    const res = await fetch(API_STATE_RESET, {
-      method: "POST",
-      cache: "no-store",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }
-    });
-    const text = await res.text();
-    const json = JSON.parse(text);
-    return json && json.ok === true;
-  } catch (e) {
-    console.warn("[reset] failed:", e);
-    return false;
-  }
-}
-
-/* ==============================
-   UI wiring
-============================== */
 
 // Heat mode toggles
-if (heatOverallBtn) {
-  heatOverallBtn.addEventListener("click", () => setHeatMode("overall"));
-}
-if (heatWorkoutBtn) {
-  heatWorkoutBtn.addEventListener("click", () => setHeatMode("workout"));
-}
+if (heatOverallBtn) heatOverallBtn.addEventListener("click", () => setHeatMode("overall"));
+if (heatWorkoutBtn) heatWorkoutBtn.addEventListener("click", () => setHeatMode("workout"));
 
-// Start / End workout
-if (startWorkoutBtn) {
-  startWorkoutBtn.addEventListener("click", async () => {
-    try {
-      await startWorkout();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to start workout.");
-    }
-  });
-}
-
-if (endWorkoutBtn) {
-  endWorkoutBtn.addEventListener("click", async () => {
-    try {
-      await endWorkout();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to end workout.");
-    }
-  });
-}
-
-// Add exercise -> creates 1 default set
-if (addExerciseBtn) {
-  addExerciseBtn.addEventListener("click", async () => {
-    try {
-      await addExerciseAsOneSet();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to add exercise.");
-    }
-  });
-}
-
-// Editor footer (past workout edit mode)
-if (discardEditBtn) {
-  discardEditBtn.addEventListener("click", async () => {
-    try {
-      if (!viewingWorkoutId) return;
-      if (pending.dirty && !confirm("Discard changes?")) return;
-      await exitPastWorkoutEdit();
-      await refreshHistory();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to exit editor.");
-    }
-  });
-}
-
-if (saveEditBtn) {
-  saveEditBtn.addEventListener("click", async () => {
-    try {
-      await savePastEdits();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to save changes.");
-    }
-  });
-}
-
-// History paging
-if (prevPageBtn) {
-  prevPageBtn.addEventListener("click", async () => {
-    if (historyPage <= 1) return;
-    historyPage--;
-    try {
-      await refreshHistory();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to load history.");
-    }
-  });
-}
-
-if (nextPageBtn) {
-  nextPageBtn.addEventListener("click", async () => {
-    if (historyPage >= historyPages) return;
-    historyPage++;
-    try {
-      await refreshHistory();
-    } catch (e) {
-      console.error(e);
-      alert(e?.message || "Failed to load history.");
-    }
-  });
-}
-
-// Recs button (manual refresh)
+/* ==============================
+   Recs button
+============================== */
 if (recsBtn) {
   recsBtn.addEventListener("click", async () => {
     try {
-      await rebuildHeatNow();
+      await rebuildHeatAndPaint();
     } catch (e) {
       console.warn("[recs] rebuild failed:", e);
-      renderRecs();
-      applyHeatToAllMeshes(Date.now());
+      const st = heat.getState();
+      renderer3d.applyHeatToAllMeshes(st, Date.now());
+      renderRecsFromState(st, Date.now());
     }
   });
 }
 
-// Reset button (nuclear)
+/* ==============================
+   Reset button (server wipe)
+============================== */
 if (resetBtn) {
   resetBtn.addEventListener("click", async () => {
     if (!confirm("Reset ALL MuscleMap data? This wipes the shared database.")) return;
@@ -1276,112 +240,63 @@ if (resetBtn) {
     }
 
     // clear local state
-    activeWorkout = null;
-    viewingWorkoutId = null;
-    viewingSets = [];
-    clearPending();
+    heat.clearAllLocalState();
+    renderer3d.clearSelected();
+    setSelectedPanel({ name: "None", groups: [] });
 
-    overallCache.lastBuiltAt = 0;
-    overallCache.logs = [];
+    // refresh workout UI (will show no workout)
+    await workoutUI.boot().catch(() => {});
+    setHeatMode("overall");
 
-    state = { logs: [], muscle: {}, lastUpdate: Date.now() };
-
-    clearSelected();
-    renderWorkoutEditor();
-    await refreshHistory().catch(() => {});
-    await rebuildHeatNow().catch(() => {});
-
-    setWorkoutHeaderUI();
     alert("All data reset.");
   });
-}
-
-/* ==============================
-   Timer tick (workout header)
-============================== */
-function tickWorkoutTimer() {
-  if (!timerText) return;
-
-  // editing a past workout => timer irrelevant
-  if (viewingWorkoutId) {
-    timerText.textContent = "—";
-    return;
-  }
-
-  if (!activeWorkout || !workoutTimerStartedAtMs) {
-    timerText.textContent = "—";
-    return;
-  }
-
-  const ms = Date.now() - workoutTimerStartedAtMs;
-  timerText.textContent = fmtElapsed(ms);
 }
 
 /* ==============================
    Resize
 ============================== */
 window.addEventListener("resize", () => {
-  renderer.setSize(mount.clientWidth, mount.clientHeight);
-  camera.aspect = mount.clientWidth / mount.clientHeight;
-  camera.updateProjectionMatrix();
+  renderer3d.resize();
 });
 
 /* ==============================
    Boot
 ============================== */
 async function boot() {
+  // exercises list (for select + optional fallback weights)
   try {
-    await renderExerciseOptions();
+    const list = await getAllExercisesCached();
+   const map = {}; // existing
+   for (const ex of list) {
+     map[ex.id] = ex.w || {};
+     const opt = document.createElement("option");
+     opt.value = ex.id;
+     opt.textContent = ex.name;
+     exerciseSelect.appendChild(opt);  // Add here
+   }
+    heat.setExerciseWeightsById(map);
+
+    
   } catch (e) {
     console.warn("[boot] exercises load failed:", e);
   }
 
-  // Status -> load current sets if active else empty view
-  try {
-    await refreshStatus();
-  } catch (e) {
-    console.warn("[boot] status failed:", e);
-    activeWorkout = null;
-  }
+  await workoutUI.boot();
+  setHeatButtons();
 
-  if (activeWorkout) {
-    try {
-      await loadCurrentWorkoutSets();
-    } catch (e) {
-      console.warn("[boot] load current workout failed:", e);
-      // fall back to “no workout” view
-      activeWorkout = null;
-      viewingWorkoutId = null;
-      viewingSets = [];
-      clearPending();
-      setWorkoutHeaderUI();
-      renderWorkoutEditor();
-    }
-  } else {
-    // no active workout
-    viewingWorkoutId = null;
-    viewingSets = [];
-    clearPending();
-    setWorkoutHeaderUI();
-    renderWorkoutEditor();
-  }
-
-  // history list
+  // initial heat build
   try {
-    await refreshHistory();
-  } catch (e) {
-    console.warn("[boot] history failed:", e);
-  }
-
-  // heat initial build
-  try {
-    await rebuildHeatNow();
+    await rebuildHeatAndPaint();
   } catch (e) {
     console.warn("[boot] heat build failed:", e);
   }
 
   // model
-  loadGLBWithFallback().catch((e) => {
+  renderer3d.loadGLBWithFallback().then(() => {
+    // repaint after model loads
+    const st = heat.getState();
+    renderer3d.applyHeatToAllMeshes(st, Date.now());
+  }).catch((e) => {
     console.error(e);
     alert("Model load failed.");
   });
@@ -1400,34 +315,34 @@ function animate() {
 
   const now = Date.now();
 
-  // timer updates every frame (cheap)
-  tickWorkoutTimer();
+  workoutUI.tickTimer(now);
 
-  // periodically rebuild heat visuals/recs (cheap-ish)
+  // periodically refresh heat visuals/recs (no network; uses current state.logs)
   if (now - lastHeatRebuildAt > 2000) {
     lastHeatRebuildAt = now;
-    rebuildMuscleFromLogs(now);
-    applyHeatToAllMeshes(now);
-    renderRecs();
+    const st = heat.tick(now);
+    renderer3d.applyHeatToAllMeshes(st, now);
+    renderRecsFromState(st, now);
   }
 
   // poll status occasionally so autoclose / other-tab changes reflect
   if (now - lastStatusPollAt > 15000) {
     lastStatusPollAt = now;
-    refreshStatus()
+
+    workoutUI.refreshStatus()
       .then(() => {
         // if active workout disappeared while not editing a past workout, refresh view
-        if (!viewingWorkoutId && !activeWorkout && heatMode === "workout") {
+        if (!workoutUI.getViewingWorkoutId() && !workoutUI.getActiveWorkout() && heat.getMode() === "workout") {
           setHeatMode("overall");
         }
-        setWorkoutHeaderUI();
+
+        workoutUI.setWorkoutHeaderUI();
         setHeatButtons();
       })
       .catch(() => {});
   }
 
-  controls.update();
-  renderer.render(scene, camera);
+  renderer3d.renderFrame();
 }
 
 animate();
