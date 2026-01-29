@@ -26,7 +26,8 @@
       <div class="hud">
         <div class="hud-top">
           <div class="hud-title">MuscleMap</div>
-          <a class="hud-link" href="./ai_chat.html">🤖 AI Exercise Builder</a>
+          <a class="hud-link" href="./ai_chat.html">AI Exercise Builder</a>
+          <button id="logoutBtn" class="btn secondary" type="button">Logout</button>
         </div>
         <div class="hud-sub">Tap a muscle • Build a workout • Watch recovery colors</div>
 
@@ -156,5 +157,19 @@
   </div>
 
   <script type="module" src="./main.js"></script>
+  <script>
+       document.getElementById('logoutBtn').addEventListener('click', async () => {
+     if (!confirm('Logout?')) return;
+     try {
+       await fetch('./api/auth/logout.php', {
+         method: 'POST',
+         credentials: 'same-origin'
+       });
+       location.assign('./login.html');
+     } catch (e) {
+       alert('Logout failed');
+     }
+   });
+  </script>
 </body>
 </html>
