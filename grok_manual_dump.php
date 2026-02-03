@@ -7,6 +7,12 @@
  * - Optional: include live DB schema + small samples (via api/db.php PDO).
  * - Optional: Q&A mode that re-reads ALL files (+ DB dump if enabled), answers, and appends to MANUAL.md.
  *
+ * NEW: Always run token_audit.php (if present) and include its output as additional context.
+ *   --token-audit=1                 (default 1)
+ *   --token-audit-top=50            (default 50)
+ *   --token-audit-json=1            (default 1)
+ *   --token-audit-python=/var/www/html/musclemap/myenv/bin/python3 (default)
+ *
  * NEW: Jump straight into Q&A using an existing manual (skip regeneration):
  *   --use-existing-manual=1     (read existing MANUAL.md and append Q&A)
  *   --manual=/path/to/MANUAL.md (optional: override which manual to use)
@@ -46,9 +52,9 @@ declare(strict_types=1);
 ========================= */
 $args = parseArgs($argv);
 
-$ROOT = rtrim($args['root'] ?? getcwd(), "/");
-$outFile = $args['out'] ?? "MANUAL.md";
-$model = $args['model'] ?? (getenv("XAI_MODEL") ?: "grok-4-1-fast-reasoning");
+$ROOT = rtrim((string)($args['root'] ?? getcwd()), "/");
+$outFile = (string)($args['out'] ?? "MANUAL.md");
+$model = (string)($args['model'] ?? (getenv("XAI_MODEL") ?: "grok-4-1-fast-reasoning"));
 
 $MAX_FILES = (int)($args['max-files'] ?? 500);
 $MAX_TOTAL_BYTES = (int)($args['max-bytes'] ?? 1_800_000);
@@ -65,6 +71,12 @@ $ONE_QUESTION = trim((string)($args['question'] ?? ""));
 // NEW: use existing manual without regenerating
 $USE_EXISTING_MANUAL = ((string)($args['use-existing-manual'] ?? "0") === "1");
 $MANUAL_PATH_RAW     = trim((string)($args['manual'] ?? ""));
+
+// NEW: token audit options (default on)
+$TOKEN_AUDIT_ENABLE = ((string)($args['token-audit'] ?? "1") === "1");
+$TOKEN_AUDIT_TOP    = max(1, (int)($args['token-audit-top'] ?? 50));
+$TOKEN_AUDIT_JSON   = ((string)($args['token-audit-json'] ?? "1") === "1");
+$TOKEN_AUDIT_PYTHON = (string)($args['token-audit-python'] ?? "/var/www/html/musclemap/myenv/bin/python3");
 
 // DB options
 $DB_ENABLE     = ((string)($args['db'] ?? "0") === "1");
@@ -94,7 +106,7 @@ if ($XAI_KEY === "") {
 /* =========================
    File selection rules
 ========================= */
-$allowedExt = ["php","js","html","css", "md", "error"];
+$allowedExt = ["php","js","html","css","md","error"];
 
 $excludeDirs = [
   ".git",
@@ -187,6 +199,61 @@ foreach ($docs as $d) {
 }
 
 /* =========================
+   Token audit (run token_audit.php and inject as context)
+========================= */
+if ($TOKEN_AUDIT_ENABLE) {
+  $tokenAuditPath = rtrim($ROOT, "/") . "/token_audit.php";
+
+  if (is_readable($tokenAuditPath)) {
+    $phpBin = PHP_BINARY ?: "php";
+
+    // Keep ignore list aligned with this script’s excludes (token_audit only matches by dirname)
+    $ignore = "node_modules,vendor,uploads,z-anatomy-unity,.git,dist,build,.next,.cache,.idea,.vscode,logs,tmp,cache";
+
+    $cmd = escapeshellcmd($phpBin)
+      . " " . escapeshellarg($tokenAuditPath)
+      . " --root=" . escapeshellarg($ROOT)
+      . " --encoding=" . escapeshellarg("cl100k_base")
+      . " --ext=" . escapeshellarg("php,js,html,css,md")
+      . " --ignore=" . escapeshellarg($ignore)
+      . " --top=" . escapeshellarg((string)$TOKEN_AUDIT_TOP)
+      . " --json=" . escapeshellarg($TOKEN_AUDIT_JSON ? "1" : "0")
+      . " --python=" . escapeshellarg($TOKEN_AUDIT_PYTHON);
+
+    $descriptors = [
+      0 => ["pipe", "r"],
+      1 => ["pipe", "w"],
+      2 => ["pipe", "w"],
+    ];
+
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if (is_resource($proc)) {
+      fclose($pipes[0]);
+      $tokOut = stream_get_contents($pipes[1]) ?: "";
+      fclose($pipes[1]);
+      $tokErr = stream_get_contents($pipes[2]) ?: "";
+      fclose($pipes[2]);
+      $code = proc_close($proc);
+
+      if ($code === 0 && trim($tokOut) !== "") {
+        $allText .= "\n\n===== TOKEN AUDIT (token_audit.php output) =====\n";
+        $allText .= $tokOut . "\n";
+      } else {
+        $allText .= "\n\n===== TOKEN AUDIT: ERROR =====\n";
+        $allText .= "exit_code={$code}\n";
+        if (trim($tokErr) !== "") $allText .= $tokErr . "\n";
+        if (trim($tokOut) !== "") $allText .= $tokOut . "\n";
+      }
+    } else {
+      $allText .= "\n\n===== TOKEN AUDIT: ERROR =====\nproc_open failed\n";
+    }
+  } else {
+    $allText .= "\n\n===== TOKEN AUDIT: SKIPPED =====\n";
+    $allText .= "token_audit.php not readable at {$tokenAuditPath}\n";
+  }
+}
+
+/* =========================
    Optional DB dump via api/db.php PDO
 ========================= */
 $dbDumpText = "";
@@ -217,6 +284,7 @@ Goals:
 - Explain important invariants and edge cases (permissions, uploads, validation, error codes).
 - Provide a "How to extend" section (adding an exercise, adding a muscle group, adding a new endpoint, etc).
 - Provide a short troubleshooting section (common errors and where to look).
+- Use the "TOKEN AUDIT" section (if present) to identify biggest files/hotspots and call them out.
 - Be specific: reference filenames and function names.
 - Output markdown.
 
@@ -247,12 +315,11 @@ $manualMd = "";
 $shouldGenerateManual = true;
 
 // If user explicitly wants to use an existing manual, skip generation.
-// (If they didn't enable Q&A, we still allow "print existing manual and exit"? No: keep it strict.)
 if ($USE_EXISTING_MANUAL) {
   $shouldGenerateManual = false;
 }
 
-// If they didn't ask for Q&A and they asked to use existing manual, just print it and exit (handy).
+// If they didn't ask for Q&A and they asked to use existing manual, just print it and exit.
 if ($USE_EXISTING_MANUAL && !$QA_MODE && $ONE_QUESTION === "") {
   $existing = safeReadFile($manualPath);
   if ($existing === null) {
@@ -267,7 +334,7 @@ if ($shouldGenerateManual) {
   $userPrompt = <<<PROMPT
 {$projectContext}
 
-Analyze ONLY these files (and DB dump if present) and generate MANUAL.md.
+Analyze ONLY these files (and DB dump / token audit if present) and generate MANUAL.md.
 
 Requirements for MANUAL.md:
 - Title + short overview
@@ -612,28 +679,22 @@ function buildDbDumpTextViaAppDb(
 }
 
 function getAppPdoFromApiDb(string $root): PDO {
-  // IMPORTANT: isolate include to avoid polluting this script with globals unexpectedly.
-  // We still need to access $pdo or db() if they exist after include.
   $path = rtrim($root, "/") . "/api/db.php";
   if (!is_readable($path)) {
     throw new RuntimeException("Cannot read api/db.php at: {$path}");
   }
 
-  // Include it (most projects create $pdo or define a db() function).
   require_once $path;
 
-  // Case A: $pdo global
   if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) {
     return $GLOBALS['pdo'];
   }
 
-  // Case B: function db(): PDO
   if (function_exists('db')) {
     $pdo = db();
     if ($pdo instanceof PDO) return $pdo;
   }
 
-  // Case C: function get_pdo(): PDO (common alt)
   if (function_exists('get_pdo')) {
     $pdo = get_pdo();
     if ($pdo instanceof PDO) return $pdo;
@@ -723,7 +784,7 @@ function answerAndAppendQA(
 {$projectContext}
 
 You are answering a developer question about this project.
-You MUST base your answer ONLY on the provided files/DB dump and the current manual text.
+You MUST base your answer ONLY on the provided files/DB dump/token audit and the current manual text.
 If the answer is not supported by the files, say so and point to what you'd inspect next.
 
 Output requirements:

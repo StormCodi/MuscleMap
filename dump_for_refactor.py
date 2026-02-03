@@ -10,10 +10,11 @@ from pathlib import Path
 # =========================
 
 FILES = [
-    "lib/workout_ui.js",
-    "main.js",
-    "lib/heat_engine.js",
-    "lib/renderer3d.js"
+    "api/workout/get_last_sets_for_exercise.php",  # NEW endpoint
+    "lib/api.js",                                  # Add API.LAST_SETS_FOR_EX const
+    "lib/workout_ui.js",                           # Update addExerciseAsOneSet()
+    "api/workout/_lib.php",                        # DB helpers (user_id, get_active_workout)
+    "api/workout/add_set.php"                      # POST add_set.php (for set format/fields)
 ]
 
 

@@ -2,7 +2,7 @@
 /**
  * token_audit.php
  *
- * Recursively scans for code files (php/js/html/css) and counts tokens using OpenAI's tiktoken
+ * Recursively scans for code files (php/js/html/css/md) and counts tokens using OpenAI's tiktoken
  * (via a small embedded Python helper).
  *
  * Requirements:
@@ -14,10 +14,11 @@
  *
  * Optional:
  *   --encoding=cl100k_base   (default)
- *   --ext=php,js,html,css
+ *   --ext=php,js,html,css,md
  *   --ignore=node_modules,vendor,uploads,z-anatomy-unity,.git
  *   --top=50
  *   --json=1
+ *   --python=/var/www/html/musclemap/myenv/bin/python3   (default)
  */
 
 declare(strict_types=1);
@@ -27,17 +28,21 @@ main($argv);
 function main(array $argv): void {
     $args = parseArgs($argv);
 
-    $root = rtrim($args['root'] ?? getcwd(), "/");
+    $root = rtrim((string)($args['root'] ?? getcwd()), "/");
     if (!is_dir($root)) {
         fwrite(STDERR, "ERROR: root is not a directory: {$root}\n");
         exit(2);
     }
 
     $encoding = (string)($args['encoding'] ?? "cl100k_base");
-    $exts = parseCsvLower($args['ext'] ?? "php,js,html,css");
-    $ignore = parseCsvLower($args['ignore'] ?? "node_modules,vendor,uploads,z-anatomy-unity,.git");
+    $exts = parseCsvLower((string)($args['ext'] ?? "php,js,html,css,md"));
+    $ignore = parseCsvLower((string)($args['ignore'] ?? "node_modules,vendor,uploads,z-anatomy-unity,.git"));
     $top = max(1, (int)($args['top'] ?? 50));
     $asJson = ((int)($args['json'] ?? 0) === 1);
+
+    // Default python path is exactly what you said you have.
+    // Caller can override: --python=/path/to/python3
+    $GLOBALS['TOK_AUDIT_PYTHON'] = (string)($args['python'] ?? "/var/www/html/musclemap/myenv/bin/python3");
 
     $files = collectFiles($root, $exts, $ignore);
     if (!$files) {
@@ -74,7 +79,7 @@ function main(array $argv): void {
 
         $bytes = strlen($content);
         $chars = mb_strlen($content, 'UTF-8');
-        $lines = substr_count($content, "\n") + (strlen($content) > 0 ? 1 : 0);
+        $lines = substr_count($content, "\n") + ($bytes > 0 ? 1 : 0);
 
         // Count tokens by piping the file content to python helper stdin
         $tokens = tiktokenCount($pyPath, $encoding, $content);
@@ -105,6 +110,7 @@ function main(array $argv): void {
             'encoding' => $encoding,
             'exts' => $exts,
             'ignore' => $ignore,
+            'python' => $GLOBALS['TOK_AUDIT_PYTHON'],
             'totals' => $totals,
             'files_sorted' => $rows,
         ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
@@ -114,7 +120,8 @@ function main(array $argv): void {
     echo "Root: {$root}\n";
     echo "Encoding: {$encoding}\n";
     echo "Extensions: " . implode(",", $exts) . "\n";
-    echo "Ignore: " . implode(",", $ignore) . "\n\n";
+    echo "Ignore: " . implode(",", $ignore) . "\n";
+    echo "Python: " . $GLOBALS['TOK_AUDIT_PYTHON'] . "\n\n";
 
     echo "TOTALS\n";
     echo "  Files:  {$totals['files']}\n";
@@ -142,22 +149,29 @@ function main(array $argv): void {
 
 function pythonHelper(): string {
     // Reads stdin bytes, decodes as UTF-8 (replace errors), counts tokens using tiktoken encoding.
+    // If anything fails, prints 0 and writes error to stderr.
     return <<<'PY'
 import sys
 import tiktoken
 
 def main():
-    if len(sys.argv) < 2:
-        print("0")
-        return
-    enc_name = sys.argv[1]
-    data = sys.stdin.buffer.read()
-    text = data.decode("utf-8", errors="replace")
+    try:
+        if len(sys.argv) < 2:
+            sys.stdout.write("0")
+            return
+        enc_name = sys.argv[1]
+        data = sys.stdin.buffer.read()
+        text = data.decode("utf-8", errors="replace")
 
-    enc = tiktoken.get_encoding(enc_name)
-    # Count tokens
-    n = len(enc.encode(text))
-    sys.stdout.write(str(n))
+        enc = tiktoken.get_encoding(enc_name)
+        n = len(enc.encode(text))
+        sys.stdout.write(str(n))
+    except Exception as e:
+        try:
+            sys.stderr.write(str(e) + "\n")
+        except Exception:
+            pass
+        sys.stdout.write("0")
 
 if __name__ == "__main__":
     main()
@@ -165,9 +179,9 @@ PY;
 }
 
 function tiktokenCount(string $pyPath, string $encoding, string $content): int {
-    $python = "myenv/bin/python3";
-    $cmd = escapeshellcmd($python) . " " . escapeshellarg($pyPath) . " " . escapeshellarg($encoding);
+    $python = (string)($GLOBALS['TOK_AUDIT_PYTHON'] ?? "/var/www/html/musclemap/myenv/bin/python3");
 
+    $cmd = escapeshellcmd($python) . " " . escapeshellarg($pyPath) . " " . escapeshellarg($encoding);
 
     $descriptors = [
         0 => ["pipe", "r"], // stdin
@@ -177,7 +191,7 @@ function tiktokenCount(string $pyPath, string $encoding, string $content): int {
 
     $proc = proc_open($cmd, $descriptors, $pipes);
     if (!is_resource($proc)) {
-        fwrite(STDERR, "ERROR: failed to start python3. Is it installed?\n");
+        fwrite(STDERR, "ERROR: failed to start python. Tried: {$python}\n");
         return 0;
     }
 
@@ -193,12 +207,11 @@ function tiktokenCount(string $pyPath, string $encoding, string $content): int {
     $code = proc_close($proc);
 
     if ($code !== 0) {
-        // Typical cause: missing tiktoken
         fwrite(STDERR, "Python error (exit {$code}): {$err}\n");
         return 0;
     }
 
-    $out = trim($out);
+    $out = trim((string)$out);
     return ctype_digit($out) ? (int)$out : 0;
 }
 
