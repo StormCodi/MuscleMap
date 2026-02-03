@@ -6,6 +6,7 @@ import { classifyMeshName } from "./lib/muscleMap.js";
 const API_CHAT   = "./api/ai_chat.php";
 const API_ADD_EX = "./api/add_exercises.php";
 const API_UPLOAD = "./api/ai_upload.php";
+const API_WORKOUT_STATUS = "./api/workout/status.php";
 
 const chatLog     = document.getElementById("chatLog");
 const composer    = document.getElementById("composer");
@@ -110,6 +111,52 @@ function makeTypingBubble(){
     </div>
   `;
   return el;
+}
+
+/* =========================
+   Redirect helper (NEW)
+========================= */
+async function redirectToMainWithPreselectIfActive(exerciseKey){
+  const safeKey = String(exerciseKey || "").trim();
+  // default: just go home
+  const goHome = () => window.location.assign("./index.html");
+
+  if (!safeKey) return goHome();
+
+  try {
+    const res = await fetch(API_WORKOUT_STATUS, {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Accept": "application/json" }
+    });
+
+    // if unauthorized, your global apiJson() handles redirects,
+    // but ai_chat.js doesn't use it, so just go to login page.
+    if (res.status === 401) {
+      window.location.assign("./login.html");
+      return;
+    }
+
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = null; }
+
+    const active = json && json.ok === true ? (json.active || null) : null;
+
+    if (active && active.id) {
+      const qp = new URLSearchParams();
+      qp.set("new_ex", safeKey);
+      qp.set("from_ai", "1");
+      window.location.assign(`./index.html?${qp.toString()}`);
+      return;
+    }
+
+    // no active workout -> just go home
+    goHome();
+  } catch {
+    goHome();
+  }
 }
 
 /* =========================
@@ -682,7 +729,7 @@ composer.addEventListener("submit", async (ev) => {
       });
     });
 
-    // accept per proposal
+    // accept per proposal (UPDATED: redirect behavior)
     aiEl.querySelectorAll("[data-accept]").forEach(btn => {
       btn.addEventListener("click", async () => {
         const idx = Number(btn.getAttribute("data-idx") || "0");
@@ -696,10 +743,9 @@ composer.addEventListener("submit", async (ev) => {
         setStatus("Adding to database…");
         try {
           await acceptProposal(p);
-          addBubble({ role:"assistant", text:`Added: ${p.name} (${p.exercise_key})` });
-          history.push({ role:"assistant", text:`Added: ${p.name} (${p.exercise_key})` });
-          saveHistory();
-          setStatus("Added.");
+          setStatus("Added. Returning to main…");
+          // Redirect to main; if workout active, preselect new_ex
+          await redirectToMainWithPreselectIfActive(p.exercise_key);
         } catch (e) {
           addBubble({ role:"assistant", text:`Failed to add: ${String(e?.message || e)}` });
           history.push({ role:"assistant", text:`Failed to add: ${String(e?.message || e)}` });

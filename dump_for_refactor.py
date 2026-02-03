@@ -10,8 +10,12 @@ from pathlib import Path
 # =========================
 
 FILES = [
-    "api/db.php",
+    "lib/workout_ui.js",
+    "main.js",
+    "lib/heat_engine.js",
+    "lib/renderer3d.js"
 ]
+
 
 
 OUT_FILE = "nice_snapshot.md"

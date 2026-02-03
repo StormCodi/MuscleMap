@@ -6,19 +6,41 @@ require __DIR__ . "/_lib.php";
 
 $uid = user_id();
 $data = read_json_body();
-require_keys($data, ["set_id"]);
 
-$setId = intv($data["set_id"], 1);
-$reps = array_key_exists("reps", $data) ? intv($data["reps"], 1, 1000) : null;
-$load = array_key_exists("load_lbs", $data) ? nullable_float($data["load_lbs"]) : null;
-$stim = array_key_exists("stimulus", $data) ? floatv($data["stimulus"], 0.0, 5.0) : null;
+$setId = array_key_exists("set_id", $data) ? (int)$data["set_id"] : 0;
+if ($setId <= 0) json_err("bad_set_id", 400);
 
-$musclesJson = null;
-$clean = null;
+$fields = [];
+$args = [];
+
+if (array_key_exists("reps", $data)) {
+  $reps = intv($data["reps"], 1, 1000);
+  $fields[] = "reps = ?";
+  $args[] = $reps;
+}
+if (array_key_exists("load_lbs", $data)) {
+  $load = nullable_float($data["load_lbs"]);
+  if ($load !== null && $load < 0) $load = 0.0;
+  $fields[] = "load_lbs = ?";
+  $args[] = $load;
+}
+if (array_key_exists("stimulus", $data)) {
+  $stim = floatv($data["stimulus"], 0.0, 5.0);
+  $fields[] = "stimulus = ?";
+  $args[] = $stim;
+}
+if (array_key_exists("completed", $data)) {
+  $completed = $data["completed"] ? 1 : 0;
+  $fields[] = "completed = ?";
+  $args[] = $completed;
+}
 if (array_key_exists("muscles", $data)) {
-  if (!is_array($data["muscles"])) json_err("muscles must be an object map");
+  // optional: allow update muscles map
+  $muscles = $data["muscles"];
+  if (!is_array($muscles)) json_err("muscles must be an object map", 400);
+
   $clean = [];
-  foreach ($data["muscles"] as $k => $v) {
+  foreach ($muscles as $k => $v) {
     $gid = strv($k);
     if ($gid === "") continue;
     if (!is_numeric($v)) continue;
@@ -26,53 +48,43 @@ if (array_key_exists("muscles", $data)) {
     if (!is_finite($w) || $w <= 0) continue;
     $clean[$gid] = $w;
   }
+
   $musclesJson = json_encode($clean, JSON_UNESCAPED_SLASHES);
   if ($musclesJson === false) $musclesJson = null;
+
+  $fields[] = "muscles_json = ?";
+  $args[] = $musclesJson;
 }
+
+if (!$fields) json_err("no_fields", 400);
 
 $now = now_sql();
-
-$cur = $pdo->prepare("
-  SELECT ws.id, ws.workout_id, w.ended_at
-  FROM workout_sets ws
-  JOIN workouts w ON w.id = ws.workout_id
-  WHERE ws.id = ? AND ws.user_id = ?
-  LIMIT 1
-");
-$cur->execute([$setId, $uid]);
-$row = $cur->fetch(PDO::FETCH_ASSOC);
-if (!$row) json_err("Set not found", 404);
-
-if ($row["ended_at"] !== null) {
-  // Allow editing ended workouts? If you want to block it, keep this. If you want allow, delete this.
-  // For now: allow edits (you asked to click old workouts and change them).
-}
-
-$fields = [];
-$params = [];
-
-if ($reps !== null) { $fields[] = "reps = ?"; $params[] = $reps; }
-if (array_key_exists("load_lbs", $data)) { $fields[] = "load_lbs = ?"; $params[] = $load; }
-if ($stim !== null) { $fields[] = "stimulus = ?"; $params[] = $stim; }
-if (array_key_exists("muscles", $data)) { $fields[] = "muscles_json = ?"; $params[] = $musclesJson; }
-
-if (!$fields) json_err("No fields to update");
-
 $fields[] = "updated_at = ?";
-$params[] = $now;
+$args[] = $now;
 
-$params[] = $setId;
-$params[] = $uid;
+$args[] = $setId;
+$args[] = $uid;
 
 $sql = "UPDATE workout_sets SET " . implode(", ", $fields) . " WHERE id = ? AND user_id = ?";
 $upd = $pdo->prepare($sql);
-$upd->execute($params);
+$upd->execute($args);
 
-$wid = (int)$row["workout_id"];
-$touch = $pdo->prepare("UPDATE workouts SET updated_at = ? WHERE id = ? AND user_id = ?");
-$touch->execute([$now, $wid, $uid]);
+if ($upd->rowCount() <= 0) {
+  json_err("not_found", 404);
+}
+
+// need summary => find workout_id
+$st = $pdo->prepare("SELECT workout_id FROM workout_sets WHERE id = ? AND user_id = ?");
+$st->execute([$setId, $uid]);
+$row = $st->fetch(PDO::FETCH_ASSOC);
+$wid = $row ? (int)$row["workout_id"] : 0;
+
+if ($wid > 0) {
+  $touch = $pdo->prepare("UPDATE workouts SET updated_at = ? WHERE id = ? AND user_id = ?");
+  $touch->execute([$now, $wid, $uid]);
+}
 
 json_ok([
   "updated" => true,
-  "summary" => workout_summary($pdo, $wid),
+  "summary" => $wid > 0 ? workout_summary($pdo, $wid) : null,
 ]);

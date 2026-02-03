@@ -22,6 +22,12 @@ $reps = intv($data["reps"], 1, 1000);
 $load = array_key_exists("load_lbs", $data) ? nullable_float($data["load_lbs"]) : null;
 $stim = floatv($data["stimulus"], 0.0, 5.0);
 
+// NEW: completed checkbox state
+$completed = 0;
+if (array_key_exists("completed", $data)) {
+  $completed = $data["completed"] ? 1 : 0;
+}
+
 $muscles = $data["muscles"];
 if (!is_array($muscles)) json_err("muscles must be an object map", 400);
 
@@ -43,15 +49,16 @@ $now = now_sql();
 
 $ins = $pdo->prepare("
   INSERT INTO workout_sets
-    (workout_id, user_id, exercise_id, exercise_name, reps, load_lbs, stimulus, muscles_json, created_at, updated_at)
+    (workout_id, user_id, exercise_id, exercise_name, reps, load_lbs, stimulus, completed, muscles_json, created_at, updated_at)
   VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ");
 $ins->execute([
   $wid, $uid,
   $exerciseId, $exerciseName,
   $reps, $load,
-  $stim, $musclesJson,
+  $stim, $completed,
+  $musclesJson,
   $now, $now
 ]);
 
@@ -70,6 +77,7 @@ json_ok([
     "reps" => $reps,
     "load_lbs" => $load,
     "stimulus" => $stim,
+    "completed" => $completed,
     "muscles" => $clean,
     "created_at" => $now,
     "updated_at" => $now,

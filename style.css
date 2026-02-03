@@ -314,23 +314,148 @@ select:focus {
   margin-top: 2px;
 }
 
+/* NEW: per-ex timer prefs (kept compact + not ugly) */
+.exTimerPrefs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.exTimerToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.20);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+  user-select: none;
+}
+
+.exTimerToggle input {
+  width: auto;
+  padding: 0;
+  margin: 0;
+}
+
+.exTimerSecsInput {
+  width: 92px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.20);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  outline: none;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.exTimerSecsInput:focus {
+  border-color: rgba(60, 255, 122, 0.35);
+}
+
+.exTimerUnit {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
 .sets {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ===== Set row layout (UPDATED for per-set timer) ===== */
+.setrow {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.setrow {
+.setrow.done {
+  opacity: 0.85;
+}
+
+.setmain {
   display: grid;
-  grid-template-columns: 1fr 1fr auto;
+  grid-template-columns: auto 1fr 1fr auto;
   gap: 8px;
   align-items: center;
 }
 
-.setrow input {
+.setmain input {
   padding: 9px 10px;
 }
 
+.chk {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chkbox {
+  width: 14px;
+  height: 14px;
+  border: 1px solid rgba(255,255,255,0.25);
+  display: inline-block;
+  border-radius: 3px;
+}
+
+/* Timer bar (UPDATED: solid green + thicker) */
+.setTimerBar {
+  position: relative;
+  height: 9px; /* thicker, but not fat */
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(0,0,0,0.18);
+}
+
+.setTimerFill {
+  height: 100%;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--accent); /* solid green */
+  transition: width 0.12s linear;
+}
+
+.setTimerBar.paused .setTimerFill {
+  filter: grayscale(0.9);
+  opacity: 0.55;
+}
+
+.setTimerBar.disabled .setTimerFill {
+  filter: grayscale(1);
+  opacity: 0.18;
+}
+
+.setTimerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.setTimerText {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.setTimerActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* existing iconbtn */
 .iconbtn {
   width: 38px;
   height: 38px;
@@ -351,6 +476,15 @@ select:focus {
 .iconbtn.bad:hover {
   background: rgba(255, 60, 60, 0.10);
   border-color: rgba(255, 60, 60, 0.25);
+}
+
+/* "ghost" buttons for timer controls */
+.iconbtn.ghost {
+  opacity: 0.85;
+}
+
+.iconbtn.ghost:hover {
+  opacity: 1;
 }
 
 .ex-actions {
@@ -497,6 +631,12 @@ select:focus {
   font-size: 12px;
 }
 
+/* pulse highlight (used by timers) */
+.pulse {
+  outline: 2px solid rgba(255,255,255,0.45);
+  border-radius: 10px;
+}
+
 /* =================================================
    DESKTOP OVERRIDE
 ================================================= */
@@ -515,6 +655,20 @@ select:focus {
   .sidebar {
     height: 100%;
     flex: none;
+  }
+}
+
+/* =================================================
+   Small mobile cleanup for timer buttons
+================================================= */
+@media (max-width: 420px) {
+  .iconbtn {
+    width: 36px;
+    height: 36px;
+  }
+
+  .exTimerSecsInput {
+    width: 84px;
   }
 }
 

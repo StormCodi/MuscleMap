@@ -10,6 +10,12 @@ import { createRenderer3D } from "./lib/renderer3d.js";
 import { createWorkoutUI } from "./lib/workout_ui.js";
 
 /* ==============================
+   URL params (NEW)
+============================== */
+const __params = new URLSearchParams(window.location.search || "");
+const __newExFromAi = String(__params.get("new_ex") || "").trim();
+
+/* ==============================
    DOM refs
 ============================== */
 const mount = document.getElementById("view");
@@ -155,7 +161,6 @@ async function saveSensitivityForSelected(v) {
   }
 }
 
-
 async function resetSensitivityForSelected() {
   if (!selectedGroups.length) return;
 
@@ -168,7 +173,6 @@ async function resetSensitivityForSelected() {
   // optional: persist reset to DB
   await saveSensitivityForSelected(sens);
 }
-
 
 /* ==============================
    Selected panel UI
@@ -270,8 +274,18 @@ const workoutUI = createWorkoutUI({
   computeStimulusSingleSet,
 
   onEditorSetsChanged: (sets) => {
-    heat.setWorkoutSets(sets);
-  },
+  heat.setWorkoutSets(sets);
+
+  // If user is viewing workout heat, repaint immediately (don’t wait for the 2s loop)
+  if (heat.getMode() === "workout") {
+    rebuildHeatAndPaint().catch((e) => console.warn("[heat] rebuild failed:", e));
+  } else {
+    // Even in overall mode, keep visuals consistent in case anything else depends on state
+    // (safe no-op-ish; rebuildNow will use cache)
+    renderer3d.applyHeatToAllMeshes(heat.getState(), Date.now());
+  }
+},
+
 
   onHeatAvailabilityChanged: ({ canWorkoutHeat }) => {
     if (!canWorkoutHeat && heat.getMode() === "workout") {
@@ -387,6 +401,17 @@ window.addEventListener("resize", () => {
 /* ==============================
    Boot
 ============================== */
+function cleanupUrlParamsIfNeeded() {
+  // Remove the AI redirect params so refresh doesn't keep reapplying.
+  if (!__params.has("new_ex") && !__params.has("from_ai")) return;
+  __params.delete("new_ex");
+  __params.delete("from_ai");
+  const qs = __params.toString();
+  const base = window.location.pathname || "./index.html";
+  const next = qs ? `${base}?${qs}` : base;
+  try { window.history.replaceState({}, "", next); } catch {}
+}
+
 async function boot() {
   // exercises list
   try {
@@ -413,6 +438,25 @@ async function boot() {
 
   await workoutUI.boot();
   setHeatButtons();
+
+  // NEW: preselect exercise after returning from AI, only if workout is active
+  try {
+    if (__newExFromAi) {
+      const active = workoutUI.getActiveWorkout?.() || null;
+      if (active && exerciseSelect) {
+        // only set if option exists (don’t inject unknown keys)
+        const opt = exerciseSelect.querySelector(`option[value="${CSS.escape(__newExFromAi)}"]`);
+        if (opt) {
+          exerciseSelect.value = __newExFromAi;
+        }
+      }
+      cleanupUrlParamsIfNeeded();
+    }
+  } catch (e) {
+    // ignore; never block boot
+    cleanupUrlParamsIfNeeded();
+    console.warn("[boot] ai preselect failed:", e);
+  }
 
   // initial heat build
   try {
