@@ -1,50 +1,8 @@
 <?php
 /**
  * grok_manual_dump.php
- *
- * Crawl project source files, send them to xAI (Grok), and generate a developer manual.
- * - Unchunked INPUT (all collected files in ONE request), auto-continue OUTPUT if needed.
- * - Optional: include live DB schema + small samples (via api/db.php PDO).
- * - Optional: Q&A mode that re-reads ALL files (+ DB dump if enabled), answers, and appends to MANUAL.md.
- *
- * NEW: Always run token_audit.php (if present) and include its output as additional context.
- *   --token-audit=1                 (default 1)
- *   --token-audit-top=50            (default 50)
- *   --token-audit-json=1            (default 1)
- *   --token-audit-python=/var/www/html/musclemap/myenv/bin/python3 (default)
- *
- * NEW: Jump straight into Q&A using an existing manual (skip regeneration):
- *   --use-existing-manual=1     (read existing MANUAL.md and append Q&A)
- *   --manual=/path/to/MANUAL.md (optional: override which manual to use)
- *
- * Usage:
- *   sudo php grok_manual_dump.php --out=MANUAL.md
- *
- * Common options:
- *   --root=/var/www/html/musclemap
- *   --model=grok-4-1-fast-reasoning
- *   --max-files=500
- *   --max-bytes=1800000
- *   --debug=1
- *   --chunk-tokens=12000
- *   --max-rounds=20
- *   --timeout=240
- *   --connect-timeout=20
- *
- * DB dump (uses api/db.php PDO):
- *   --db=1
- *   --db-sample=5
- *   --db-max-bytes=250000
- *   --db-cell-max=500
- *   --db-tables=exercises,workouts   (optional allowlist)
- *
- * Q&A:
- *   --qa=1                 (interactive Q&A loop; appends to manual)
- *   --question="..."       (one-shot; appends answer and exits)
- *   --use-existing-manual=1
- *   --manual=/path/to/MANUAL.md
+ * (same header as your current version)
  */
-
 declare(strict_types=1);
 
 /* =========================
@@ -68,17 +26,11 @@ $CONN_TIMEOUT = (int)($args['connect-timeout'] ?? 20);
 $QA_MODE      = ((string)($args['qa'] ?? "0") === "1");
 $ONE_QUESTION = trim((string)($args['question'] ?? ""));
 
-// NEW: use existing manual without regenerating
+$JSON_MODE    = ((string)($args['json'] ?? "0") === "1");
+
 $USE_EXISTING_MANUAL = ((string)($args['use-existing-manual'] ?? "0") === "1");
 $MANUAL_PATH_RAW     = trim((string)($args['manual'] ?? ""));
 
-// NEW: token audit options (default on)
-$TOKEN_AUDIT_ENABLE = ((string)($args['token-audit'] ?? "1") === "1");
-$TOKEN_AUDIT_TOP    = max(1, (int)($args['token-audit-top'] ?? 50));
-$TOKEN_AUDIT_JSON   = ((string)($args['token-audit-json'] ?? "1") === "1");
-$TOKEN_AUDIT_PYTHON = (string)($args['token-audit-python'] ?? "/var/www/html/musclemap/myenv/bin/python3");
-
-// DB options
 $DB_ENABLE     = ((string)($args['db'] ?? "0") === "1");
 $DB_SAMPLE     = max(0, (int)($args['db-sample'] ?? 5));
 $DB_MAX_BYTES  = max(0, (int)($args['db-max-bytes'] ?? 250_000));
@@ -87,20 +39,19 @@ $DB_TABLES_RAW = trim((string)($args['db-tables'] ?? ""));
 $DB_ALLOWLIST  = $DB_TABLES_RAW !== "" ? array_values(array_filter(array_map('trim', explode(',', $DB_TABLES_RAW)))) : [];
 
 if (!is_dir($ROOT)) {
-  fwrite(STDERR, "ERROR: root dir not found: {$ROOT}\n");
-  exit(1);
+  emitError("root dir not found: {$ROOT}", 1, $JSON_MODE);
 }
 
-/* =========================
-   xAI key (env or /etc)
-========================= */
 $XAI_KEY = trim((string)getenv("XAI_API_KEY"));
 if ($XAI_KEY === "") {
   $XAI_KEY = readSecretFile("/etc/musclemap/xai_api_key") ?? "";
 }
 if ($XAI_KEY === "") {
-  fwrite(STDERR, "ERROR: missing XAI_API_KEY (env) or /etc/musclemap/xai_api_key\n");
-  exit(1);
+  emitError("missing XAI_API_KEY (env) or /etc/musclemap/xai_api_key", 1, $JSON_MODE);
+}
+
+if ($JSON_MODE && $QA_MODE && $ONE_QUESTION === "") {
+  emitError("json_mode does not support interactive --qa=1. Use --question=\"...\".", 1, $JSON_MODE);
 }
 
 /* =========================
@@ -109,37 +60,15 @@ if ($XAI_KEY === "") {
 $allowedExt = ["php","js","html","css","md","error"];
 
 $excludeDirs = [
-  ".git",
-  "vendor",
-  "node_modules",
-  "uploads",
-  "uploads/ai_intake",
-  "z-anatomy-unity",
-  "assets/models",
-  "dist",
-  "build",
-  ".next",
-  ".cache",
-  ".idea",
-  ".vscode",
-  "logs",
-  "tmp",
-  "cache",
+  ".git","vendor","node_modules","uploads","uploads/ai_intake","z-anatomy-unity",
+  "assets/models","dist","build",".next",".cache",".idea",".vscode","logs","tmp","cache",
 ];
 
-$excludeFiles = [
-  ".env",
-  ".env.local",
-  ".env.production",
-];
+$excludeFiles = [".env",".env.local",".env.production"];
 
-/* =========================
-   Safe iterator (avoid permission death)
-========================= */
 class SafeRecursiveDirectoryIterator extends RecursiveDirectoryIterator {
   public function hasChildren($allow_links = false): bool {
-    try { return parent::hasChildren($allow_links); }
-    catch (Throwable $e) { return false; }
+    try { return parent::hasChildren($allow_links); } catch (Throwable $e) { return false; }
   }
   public function getChildren(): RecursiveDirectoryIterator {
     try { return parent::getChildren(); }
@@ -147,31 +76,18 @@ class SafeRecursiveDirectoryIterator extends RecursiveDirectoryIterator {
   }
 }
 
-/* =========================
-   Collect files
-========================= */
 $files = collectFiles($ROOT, $allowedExt, $excludeDirs, $excludeFiles, $MAX_FILES, $MAX_TOTAL_BYTES, $DEBUG);
 
-if (count($files) === 0) {
-  fwrite(STDERR, "ERROR: no files collected (check excludes/root)\n");
-  exit(1);
-}
-
+if (count($files) === 0) emitError("no files collected (check excludes/root)", 1, $JSON_MODE);
 if ($DEBUG) fwrite(STDERR, "Collected " . count($files) . " files\n");
 
-/* =========================
-   Read file contents (bounded)
-========================= */
 $totalBytes = 0;
 $docs = [];
-
 foreach ($files as $f) {
   $abs = $f["abs"];
   $rel = $f["rel"];
-
   $content = safeReadFile($abs);
   if ($content === null) continue;
-
   $bytes = strlen($content);
   if ($bytes <= 0) continue;
 
@@ -184,94 +100,26 @@ foreach ($files as $f) {
 
   $docs[] = ["rel" => $rel, "content" => $content, "bytes" => $bytes];
   $totalBytes += $bytes;
-
   if ($totalBytes >= $MAX_TOTAL_BYTES) break;
 }
-
 if ($DEBUG) fwrite(STDERR, "Total bytes loaded: {$totalBytes}\n");
 
-/* =========================
-   Build text payload
-========================= */
 $allText = "";
 foreach ($docs as $d) {
   $allText .= "===== FILE: {$d["rel"]} =====\n{$d["content"]}\n\n";
 }
 
-/* =========================
-   Token audit (run token_audit.php and inject as context)
-========================= */
-if ($TOKEN_AUDIT_ENABLE) {
-  $tokenAuditPath = rtrim($ROOT, "/") . "/token_audit.php";
-
-  if (is_readable($tokenAuditPath)) {
-    $phpBin = PHP_BINARY ?: "php";
-
-    // Keep ignore list aligned with this script’s excludes (token_audit only matches by dirname)
-    $ignore = "node_modules,vendor,uploads,z-anatomy-unity,.git,dist,build,.next,.cache,.idea,.vscode,logs,tmp,cache";
-
-    $cmd = escapeshellcmd($phpBin)
-      . " " . escapeshellarg($tokenAuditPath)
-      . " --root=" . escapeshellarg($ROOT)
-      . " --encoding=" . escapeshellarg("cl100k_base")
-      . " --ext=" . escapeshellarg("php,js,html,css,md")
-      . " --ignore=" . escapeshellarg($ignore)
-      . " --top=" . escapeshellarg((string)$TOKEN_AUDIT_TOP)
-      . " --json=" . escapeshellarg($TOKEN_AUDIT_JSON ? "1" : "0")
-      . " --python=" . escapeshellarg($TOKEN_AUDIT_PYTHON);
-
-    $descriptors = [
-      0 => ["pipe", "r"],
-      1 => ["pipe", "w"],
-      2 => ["pipe", "w"],
-    ];
-
-    $proc = proc_open($cmd, $descriptors, $pipes);
-    if (is_resource($proc)) {
-      fclose($pipes[0]);
-      $tokOut = stream_get_contents($pipes[1]) ?: "";
-      fclose($pipes[1]);
-      $tokErr = stream_get_contents($pipes[2]) ?: "";
-      fclose($pipes[2]);
-      $code = proc_close($proc);
-
-      if ($code === 0 && trim($tokOut) !== "") {
-        $allText .= "\n\n===== TOKEN AUDIT (token_audit.php output) =====\n";
-        $allText .= $tokOut . "\n";
-      } else {
-        $allText .= "\n\n===== TOKEN AUDIT: ERROR =====\n";
-        $allText .= "exit_code={$code}\n";
-        if (trim($tokErr) !== "") $allText .= $tokErr . "\n";
-        if (trim($tokOut) !== "") $allText .= $tokOut . "\n";
-      }
-    } else {
-      $allText .= "\n\n===== TOKEN AUDIT: ERROR =====\nproc_open failed\n";
-    }
-  } else {
-    $allText .= "\n\n===== TOKEN AUDIT: SKIPPED =====\n";
-    $allText .= "token_audit.php not readable at {$tokenAuditPath}\n";
-  }
-}
-
-/* =========================
-   Optional DB dump via api/db.php PDO
-========================= */
 $dbDumpText = "";
 if ($DB_ENABLE) {
   try {
     $dbDumpText = buildDbDumpTextViaAppDb($ROOT, $DB_SAMPLE, $DB_MAX_BYTES, $DB_CELL_MAX, $DB_ALLOWLIST, $DEBUG);
-    if ($dbDumpText !== "") {
-      $allText .= "\n\n" . $dbDumpText . "\n\n";
-    }
+    if ($dbDumpText !== "") $allText .= "\n\n" . $dbDumpText . "\n\n";
   } catch (Throwable $e) {
     fwrite(STDERR, "WARNING: DB dump failed: " . $e->getMessage() . "\n");
     $allText .= "\n\n===== DB: ERROR =====\n" . $e->getMessage() . "\n\n";
   }
 }
 
-/* =========================
-   Grok prompt (manual)
-========================= */
 $projectContext = <<<TXT
 You are generating a developer manual for this project.
 
@@ -284,7 +132,6 @@ Goals:
 - Explain important invariants and edge cases (permissions, uploads, validation, error codes).
 - Provide a "How to extend" section (adding an exercise, adding a muscle group, adding a new endpoint, etc).
 - Provide a short troubleshooting section (common errors and where to look).
-- Use the "TOKEN AUDIT" section (if present) to identify biggest files/hotspots and call them out.
 - Be specific: reference filenames and function names.
 - Output markdown.
 
@@ -293,48 +140,49 @@ Constraints:
 - If something is missing, say "not found in provided files".
 TXT;
 
-/* =========================
-   Resolve output path / manual path
-========================= */
 $absOut = $outFile;
 if (!isAbsPath($absOut)) $absOut = $ROOT . "/" . $outFile;
 
-// If --manual= is provided, it becomes the manual path for Q&A.
-// Otherwise, Q&A uses $absOut (same as --out path).
 $manualPath = $MANUAL_PATH_RAW !== "" ? $MANUAL_PATH_RAW : $absOut;
 if ($MANUAL_PATH_RAW !== "" && !isAbsPath($manualPath)) {
-  // Interpret relative manual paths as relative to ROOT (same behavior as --out)
   $manualPath = $ROOT . "/" . ltrim($manualPath, "/");
 }
 
-/* =========================
-   Manual generation OR skip (use existing)
-========================= */
 $manualMd = "";
+$shouldGenerateManual = !$USE_EXISTING_MANUAL;
 
-$shouldGenerateManual = true;
-
-// If user explicitly wants to use an existing manual, skip generation.
-if ($USE_EXISTING_MANUAL) {
-  $shouldGenerateManual = false;
-}
-
-// If they didn't ask for Q&A and they asked to use existing manual, just print it and exit.
 if ($USE_EXISTING_MANUAL && !$QA_MODE && $ONE_QUESTION === "") {
   $existing = safeReadFile($manualPath);
-  if ($existing === null) {
-    fwrite(STDERR, "ERROR: --use-existing-manual=1 but manual not found/readable: {$manualPath}\n");
-    exit(1);
+  if ($existing === null) emitError("--use-existing-manual=1 but manual not found/readable: {$manualPath}", 1, $JSON_MODE);
+
+  if ($JSON_MODE) {
+    echo json_encode([
+      "ok" => true, "mode" => "existing",
+      "manual_path" => $manualPath, "out_path" => $absOut,
+      "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+      "output" => rtrim($existing) . "\n",
+    ], JSON_UNESCAPED_SLASHES);
+    exit(0);
   }
+
   echo rtrim($existing) . "\n";
   exit(0);
 }
 
 if ($shouldGenerateManual) {
-  $userPrompt = <<<PROMPT
-{$projectContext}
+  $attempts = 0;
+  $maxAttempts = 3;
+  $lastMd = "";
+  $retryNudge = "";
 
-Analyze ONLY these files (and DB dump / token audit if present) and generate MANUAL.md.
+  while (true) {
+    $attempts++;
+
+    $userPrompt = <<<PROMPT
+{$projectContext}
+{$retryNudge}
+
+Analyze ONLY these files (and DB dump if present) and generate MANUAL.md.
 
 Requirements for MANUAL.md:
 - Title + short overview
@@ -349,79 +197,95 @@ Requirements for MANUAL.md:
   7) Troubleshooting (common errors, logs, permissions, DB)
   8) Q&A (empty starter section with a short note: questions/answers appended over time)
 
+IMPORTANT:
+- The manual is NOT acceptable unless it includes section "8) Q&A" (or "## Q&A") at the end.
+
 FILES:
 {$allText}
 PROMPT;
 
-  $messages = [
-    ["role" => "system", "content" => "You are a senior engineer writing internal docs. Produce a complete markdown manual. No extra commentary."],
-    ["role" => "user", "content" => $userPrompt],
-  ];
+    $messages = [
+      ["role" => "system", "content" => "You are a senior engineer writing internal docs. Produce a complete markdown manual. No extra commentary."],
+      ["role" => "user", "content" => $userPrompt],
+    ];
 
-  /* =========================
-     Generate manual (auto-continue until model stops)
-  ========================= */
-  $manualMd = xaiChat(
-    $XAI_KEY,
-    $model,
-    $messages,
-    0.2,
-    $CHUNK_TOKENS,
-    $TIMEOUT,
-    $CONN_TIMEOUT,
-    $DEBUG,
-    $MAX_ROUNDS
-  );
+    if ($DEBUG) fwrite(STDERR, "Manual generation attempt {$attempts}/{$maxAttempts}\n");
 
-  $manualMd = trim($manualMd) . "\n";
+    $md = xaiChat($XAI_KEY, $model, $messages, 0.2, $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
+    $md = trim($md) . "\n";
+    $lastMd = $md;
 
-  /* =========================
-     Write output and print
-  ========================= */
+    if (manualLooksComplete($md)) {
+      if ($DEBUG) fwrite(STDERR, "Manual looks complete (passed checks).\n");
+      $manualMd = $md;
+      break;
+    }
+
+    if ($DEBUG) fwrite(STDERR, "Manual incomplete (failed checks). Restarting from scratch.\n");
+
+    if ($attempts >= $maxAttempts) {
+      fwrite(STDERR, "WARNING: manual incomplete after {$maxAttempts} attempts; writing last result anyway.\n");
+      $manualMd = $lastMd;
+      break;
+    }
+
+    $retryNudge = buildRetryNudge($md);
+  }
+
   if (@file_put_contents($absOut, $manualMd) === false) {
-    fwrite(STDERR, "ERROR: failed to write {$absOut}\n");
-    exit(1);
+    emitError("failed to write {$absOut}", 1, $JSON_MODE);
+  }
+
+  if ($JSON_MODE) {
+    echo json_encode([
+      "ok" => true, "mode" => "generated",
+      "manual_path" => $manualPath, "out_path" => $absOut,
+      "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+      "output" => $manualMd,
+    ], JSON_UNESCAPED_SLASHES);
+    exit(0);
   }
 
   echo $manualMd;
 } else {
-  // Using existing manual: load it now (Q&A will append)
   $existing = safeReadFile($manualPath);
-  if ($existing === null) {
-    fwrite(STDERR, "ERROR: --use-existing-manual=1 but manual not found/readable: {$manualPath}\n");
-    exit(1);
-  }
+  if ($existing === null) emitError("--use-existing-manual=1 but manual not found/readable: {$manualPath}", 1, $JSON_MODE);
   $manualMd = rtrim($existing) . "\n";
 }
 
-/* =========================
-   Q&A mode (append answers)
-========================= */
 if ($ONE_QUESTION !== "" || $QA_MODE) {
   $currentManual = safeReadFile($manualPath) ?? $manualMd;
 
   if ($ONE_QUESTION !== "") {
     $updated = answerAndAppendQA(
-      $XAI_KEY,
-      $model,
-      $projectContext,
-      $allText,
-      $currentManual,
-      $ONE_QUESTION,
-      $CHUNK_TOKENS,
-      $TIMEOUT,
-      $CONN_TIMEOUT,
-      $DEBUG,
-      $MAX_ROUNDS
+      $XAI_KEY, $model, $projectContext, $allText, $currentManual, $ONE_QUESTION,
+      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS
     );
 
     if (@file_put_contents($manualPath, $updated) === false) {
-      fwrite(STDERR, "ERROR: failed to write updated manual with Q&A to {$manualPath}\n");
-      exit(1);
+      emitError("failed to write updated manual with Q&A to {$manualPath}", 1, $JSON_MODE);
     }
 
-    echo "\n\n" . extractLastQaBlock($updated) . "\n";
+    $lastBlock = extractLastQaBlock($updated);
+
+    if ($JSON_MODE) {
+      echo json_encode([
+        "ok" => true, "mode" => "qa_one_shot",
+        "manual_path" => $manualPath, "out_path" => $absOut,
+        "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+        "question" => $ONE_QUESTION,
+        "output" => $lastBlock,
+      ], JSON_UNESCAPED_SLASHES);
+      exit(0);
+    }
+
+    echo "\n\n" . $lastBlock . "\n";
     exit(0);
+  }
+
+  // interactive mode only when not json
+  if ($JSON_MODE) {
+    emitError("json_mode does not support interactive qa loop; use --question", 1, $JSON_MODE);
   }
 
   fwrite(STDERR, "\nQ&A mode. Type a question and press Enter.\n");
@@ -440,17 +304,8 @@ if ($ONE_QUESTION !== "" || $QA_MODE) {
     $currentManual = safeReadFile($manualPath) ?? $currentManual;
 
     $updated = answerAndAppendQA(
-      $XAI_KEY,
-      $model,
-      $projectContext,
-      $allText,
-      $currentManual,
-      $q,
-      $CHUNK_TOKENS,
-      $TIMEOUT,
-      $CONN_TIMEOUT,
-      $DEBUG,
-      $MAX_ROUNDS
+      $XAI_KEY, $model, $projectContext, $allText, $currentManual, $q,
+      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS
     );
 
     if (@file_put_contents($manualPath, $updated) === false) {
@@ -468,6 +323,15 @@ exit(0);
 /* =========================
    Helpers
 ========================= */
+
+function emitError(string $msg, int $code, bool $jsonMode): void {
+  if ($jsonMode) {
+    echo json_encode(["ok" => false, "error" => $msg], JSON_UNESCAPED_SLASHES);
+    exit($code);
+  }
+  fwrite(STDERR, "ERROR: {$msg}\n");
+  exit($code);
+}
 
 function parseArgs(array $argv): array {
   $out = [];
@@ -510,9 +374,7 @@ function shouldExcludeRel(string $rel, array $excludeDirs, array $excludeFiles):
   $relTrim = trim($rel, "/");
 
   $base = basename($relTrim);
-  foreach ($excludeFiles as $xf) {
-    if ($base === $xf) return true;
-  }
+  foreach ($excludeFiles as $xf) if ($base === $xf) return true;
 
   foreach ($excludeDirs as $xd) {
     $xd = trim(str_replace("\\", "/", $xd), "/");
@@ -520,7 +382,6 @@ function shouldExcludeRel(string $rel, array $excludeDirs, array $excludeFiles):
     if ($relTrim === $xd) return true;
     if (strpos($relTrim . "/", $xd . "/") === 0) return true;
   }
-
   return false;
 }
 
@@ -534,7 +395,6 @@ function collectFiles(
   bool $debug
 ): array {
   $files = [];
-
   $itFlags = FilesystemIterator::SKIP_DOTS;
   $dirIt = new SafeRecursiveDirectoryIterator($root, $itFlags);
 
@@ -563,7 +423,6 @@ function collectFiles(
   );
 
   $rii = new RecursiveIteratorIterator($filter, RecursiveIteratorIterator::LEAVES_ONLY);
-
   $estimatedBytes = 0;
 
   foreach ($rii as $fileInfo) {
@@ -584,9 +443,7 @@ function collectFiles(
   }
 
   usort($files, fn($a,$b) => strcmp($a["rel"], $b["rel"]));
-
   if ($debug) fwrite(STDERR, "Estimated bytes (sizes): {$estimatedBytes}\n");
-
   return $files;
 }
 
@@ -612,9 +469,7 @@ function buildDbDumpTextViaAppDb(
   $pdo = getAppPdoFromApiDb($root);
 
   $tables = [];
-  foreach ($pdo->query("SHOW TABLES") as $row) {
-    $tables[] = (string)array_values($row)[0];
-  }
+  foreach ($pdo->query("SHOW TABLES") as $row) $tables[] = (string)array_values($row)[0];
   sort($tables);
 
   if ($allowlist) {
@@ -629,40 +484,30 @@ function buildDbDumpTextViaAppDb(
   foreach ($tables as $t) {
     $section = "";
 
-    // SHOW CREATE TABLE
     $stmt = $pdo->query("SHOW CREATE TABLE `{$t}`");
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     $createSql = "";
     if ($row) {
       foreach ($row as $k => $v) {
-        if (stripos($k, "Create Table") !== false) {
-          $createSql = (string)$v;
-          break;
-        }
+        if (stripos($k, "Create Table") !== false) { $createSql = (string)$v; break; }
       }
     }
 
     $section .= "===== DB: SHOW_CREATE_TABLE {$t} =====\n";
     $section .= $createSql !== "" ? ($createSql . "\n\n") : "(not found)\n\n";
 
-    // FULL COLUMNS
     $section .= "===== DB: FULL_COLUMNS {$t} =====\n";
     $cols = $pdo->query("SHOW FULL COLUMNS FROM `{$t}`")->fetchAll(PDO::FETCH_ASSOC);
-    $section .= renderRowsAsMarkdownTable($cols, $cellMax);
-    $section .= "\n\n";
+    $section .= renderRowsAsMarkdownTable($cols, $cellMax) . "\n\n";
 
-    // INDEXES
     $section .= "===== DB: INDEXES {$t} =====\n";
     $idx = $pdo->query("SHOW INDEX FROM `{$t}`")->fetchAll(PDO::FETCH_ASSOC);
-    $section .= renderRowsAsMarkdownTable($idx, $cellMax);
-    $section .= "\n\n";
+    $section .= renderRowsAsMarkdownTable($idx, $cellMax) . "\n\n";
 
-    // SAMPLE ROWS
     if ($sampleRows > 0) {
       $section .= "===== DB: SAMPLE_ROWS {$t} (LIMIT {$sampleRows}) =====\n";
       $rows = $pdo->query("SELECT * FROM `{$t}` LIMIT {$sampleRows}")->fetchAll(PDO::FETCH_ASSOC);
-      $section .= renderRowsAsMarkdownTable($rows, $cellMax);
-      $section .= "\n\n";
+      $section .= renderRowsAsMarkdownTable($rows, $cellMax) . "\n\n";
     }
 
     if ($bytes + strlen($section) > $maxBytes) {
@@ -680,36 +525,29 @@ function buildDbDumpTextViaAppDb(
 
 function getAppPdoFromApiDb(string $root): PDO {
   $path = rtrim($root, "/") . "/api/db.php";
-  if (!is_readable($path)) {
-    throw new RuntimeException("Cannot read api/db.php at: {$path}");
-  }
+  if (!is_readable($path)) throw new RuntimeException("Cannot read api/db.php at: {$path}");
 
+  // IMPORTANT: include inside function -> db.php must export PDO via $GLOBALS / db()
   require_once $path;
 
-  if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) {
-    return $GLOBALS['pdo'];
-  }
+  if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) return $GLOBALS['pdo'];
 
   if (function_exists('db')) {
     $pdo = db();
     if ($pdo instanceof PDO) return $pdo;
   }
-
   if (function_exists('get_pdo')) {
     $pdo = get_pdo();
     if ($pdo instanceof PDO) return $pdo;
   }
 
-  throw new RuntimeException("api/db.php did not expose a PDO. Expected \$pdo global or db()/get_pdo() function.");
+  throw new RuntimeException("api/db.php did not expose a PDO. Expected \$GLOBALS['pdo'] or db()/get_pdo().");
 }
 
 function renderRowsAsMarkdownTable(array $rows, int $cellMax): string {
   if (!$rows) return "(no rows)\n";
-
   $cols = [];
-  foreach ($rows as $r) {
-    foreach (array_keys($r) as $k) $cols[$k] = true;
-  }
+  foreach ($rows as $r) foreach (array_keys($r) as $k) $cols[$k] = true;
   $cols = array_keys($cols);
 
   $out = "| " . implode(" | ", array_map('escapeMd', $cols)) . " |\n";
@@ -722,14 +560,12 @@ function renderRowsAsMarkdownTable(array $rows, int $cellMax): string {
       if ($v === null) $s = "NULL";
       elseif (is_bool($v)) $s = $v ? "1" : "0";
       else $s = (string)$v;
-
       $s = normalizeWhitespace($s);
       if (mb_strlen($s) > $cellMax) $s = mb_substr($s, 0, $cellMax) . "…";
       $vals[] = escapeMd($s);
     }
     $out .= "| " . implode(" | ", $vals) . " |\n";
   }
-
   return $out;
 }
 
@@ -745,12 +581,46 @@ function escapeMd(string $s): string {
 }
 
 /* =========================
+   Manual completeness checks
+========================= */
+
+function manualLooksComplete(string $md): bool {
+  $md = trim($md);
+  if ($md === "") return false;
+
+  $hasQa =
+    (bool)preg_match('/^##\s*8\)\s*Q&A\s*$/mi', $md) ||
+    (bool)preg_match('/^##\s*Q&A\s*$/mi', $md);
+
+  if (!$hasQa) return false;
+
+  for ($i = 1; $i <= 7; $i++) {
+    $ok = (bool)preg_match('/^##\s*' . preg_quote((string)$i, '/') . '\)\s+/m', $md);
+    if (!$ok) return false;
+  }
+  return true;
+}
+
+function buildRetryNudge(string $md): string {
+  $missing = [];
+  for ($i = 1; $i <= 8; $i++) {
+    $has = (bool)preg_match('/^##\s*' . preg_quote((string)$i, '/') . '\)\s+/m', $md);
+    if (!$has) $missing[] = $i;
+  }
+  if (!$missing && !preg_match('/^##\s*Q&A\s*$/mi', $md)) $missing[] = 8;
+  if (!$missing) return "";
+
+  $list = implode(", ", $missing);
+  return "\n\nIMPORTANT: Your last output was incomplete. Missing section numbers detected: {$list}. ".
+         "Regenerate the FULL manual from scratch and include sections 1) through 8) with 8) Q&A at the end.\n";
+}
+
+/* =========================
    Q&A helpers
 ========================= */
 
 function ensureQaSectionExists(string $manual): string {
   if (preg_match('/^##\s+Q&A\s*$/mi', $manual)) return rtrim($manual) . "\n";
-
   $manual = rtrim($manual) . "\n\n";
   $manual .= "## Q&A\n\n";
   $manual .= "_Questions and answers are appended here over time._\n";
@@ -784,7 +654,7 @@ function answerAndAppendQA(
 {$projectContext}
 
 You are answering a developer question about this project.
-You MUST base your answer ONLY on the provided files/DB dump/token audit and the current manual text.
+You MUST base your answer ONLY on the provided files/DB dump and the current manual text.
 If the answer is not supported by the files, say so and point to what you'd inspect next.
 
 Output requirements:
@@ -902,12 +772,9 @@ function xaiChat(
     $content = (string)($choice["message"]["content"] ?? "");
     $finish  = (string)($choice["finish_reason"] ?? "unknown");
 
-    if ($debug) {
-      fwrite(STDERR, "Round {$round}: finish_reason={$finish}, bytes=" . strlen($content) . "\n");
-    }
+    if ($debug) fwrite(STDERR, "Round {$round}: finish_reason={$finish}, bytes=" . strlen($content) . "\n");
 
     if ($content !== "") $full .= $content;
-
     if ($finish !== "length") break;
 
     $messages[] = ["role" => "assistant", "content" => $content];

@@ -10,11 +10,23 @@ from pathlib import Path
 # =========================
 
 FILES = [
-    "api/workout/get_last_sets_for_exercise.php",  # NEW endpoint
-    "lib/api.js",                                  # Add API.LAST_SETS_FOR_EX const
-    "lib/workout_ui.js",                           # Update addExerciseAsOneSet()
-    "api/workout/_lib.php",                        # DB helpers (user_id, get_active_workout)
-    "api/workout/add_set.php"                      # POST add_set.php (for set format/fields)
+    # 1. Change "copy last checked-off set across workouts" (not just last workout)
+    "api/workout/get_last_sets_for_exercise.php",
+    
+    # 2. Add "remove exercise" button (delete all sets for exercise_id)
+    "lib/workout_editor.js",
+    "api/workout/delete_sets_for_exercise.php",  # New endpoint (or extend delete_set.php)
+    
+    # 3. Hide/mark used exercises in dropdown (track active workout exercises client-side)
+    "lib/workout_ui.js",
+    "main.js",
+    
+    # 4. Propagation clarification: No change needed (per-row only); if desired, add to workout_editor.js
+    # Crucial context (read-only):
+    "lib/workout_ui.js",  # Orchestrates addExerciseAsOneSet() + viewingSets
+    "main.js",            # exerciseSelect population + addExerciseAsOneSet()
+    "api/workout/add_set.php",  # Set insertion (called by ui)
+    "api/workout/_lib.php",     # workout_summary(), get_active_workout()
 ]
 
 
