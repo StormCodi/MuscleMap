@@ -43,25 +43,9 @@ function safeRunId(string $s): string {
   if (!preg_match('/^[A-Za-z0-9_-]{8,80}$/', $s)) return "";
   return $s;
 }
-function tailFile(string $path, int $maxBytes): string {
-  if (!is_file($path) || !is_readable($path)) return "";
-  $size = @filesize($path);
-  if (!is_int($size) || $size <= 0) return "";
-  $read = min($maxBytes, $size);
-  $fh = @fopen($path, "rb");
-  if (!$fh) return "";
-  @fseek($fh, -$read, SEEK_END);
-  $data = @fread($fh, $read);
-  @fclose($fh);
-  if ($data === false) return "";
-  // normalize newlines a bit
-  return str_replace("\r\n", "\n", $data);
-}
-
 function runDir(string $base, string $runId): string {
   return rtrim($base, "/") . "/" . $runId;
 }
-
 function mkRunId(): string {
   $t = (string)time();
   $r = bin2hex(random_bytes(8));
@@ -69,7 +53,33 @@ function mkRunId(): string {
 }
 
 /**
- * Status endpoint (GET ?status=1&run_id=...)
+ * Read file append from offset. Returns [appendString, newOffset].
+ */
+function readAppend(string $path, int $offset, int $maxBytes): array {
+  if (!is_file($path) || !is_readable($path)) return ["", $offset];
+  $size = @filesize($path);
+  if (!is_int($size) || $size < 0) return ["", $offset];
+  if ($offset < 0) $offset = 0;
+  if ($offset > $size) $offset = $size;
+
+  $toRead = $size - $offset;
+  if ($toRead <= 0) return ["", $offset];
+
+  $toRead = min($toRead, $maxBytes);
+
+  $fh = @fopen($path, "rb");
+  if (!$fh) return ["", $offset];
+  @fseek($fh, $offset, SEEK_SET);
+  $data = @fread($fh, $toRead);
+  @fclose($fh);
+
+  if ($data === false) $data = "";
+  $newOff = $offset + strlen($data);
+  return [str_replace("\r\n", "\n", $data), $newOff];
+}
+
+/**
+ * Status endpoint (GET ?status=1&run_id=...&stderr_off=&stdout_off=...)
  */
 if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
   $runId = safeRunId((string)($_GET["run_id"] ?? ""));
@@ -83,31 +93,34 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
 
   if (!is_file($metaPath)) json_err("run_not_found", 404);
 
-  $metaRaw = @file_get_contents($metaPath);
-  $meta = json_decode($metaRaw ?: "{}", true);
-  if (!is_array($meta)) $meta = [];
-
   $running = !is_file($exitPath);
 
-  $stderrTail = tailFile($stderrPath, 16000);
-  $stdoutTail = tailFile($stdoutPath, 6000); // JSON is huge; only a bit
-  $tail = "";
-  if ($stderrTail !== "") {
-    $tail .= "----- STDERR (tail) -----\n" . $stderrTail;
+  $stderrOff = asInt($_GET["stderr_off"] ?? 0, 0);
+  $stdoutOff = asInt($_GET["stdout_off"] ?? 0, 0);
+
+  // stream some append content each poll
+  $CAP_APPEND = 18000;
+
+  [$stderrAppend, $stderrNew] = readAppend($stderrPath, $stderrOff, $CAP_APPEND);
+  [$stdoutAppend, $stdoutNew] = readAppend($stdoutPath, $stdoutOff, (int)($CAP_APPEND * 0.5)); // stdout json can be huge
+
+  $append = "";
+  if ($stderrAppend !== "") $append .= $stderrAppend;
+  if ($stdoutAppend !== "") {
+    if ($append !== "" && !str_ends_with($append, "\n")) $append .= "\n";
+    $append .= $stdoutAppend;
   }
-  if ($stdoutTail !== "") {
-    if ($tail !== "") $tail .= "\n\n";
-    $tail .= "----- STDOUT (tail) -----\n" . $stdoutTail;
-  }
-  if ($tail === "") $tail = "(no output yet)";
 
   if ($running) {
     json_ok([
       "running" => true,
-      "tail" => $tail,
+      "append" => $append,
+      "stderr_off" => $stderrNew,
+      "stdout_off" => $stdoutNew,
     ]);
   }
 
+  // done
   $exitCode = null;
   $exitRaw = @file_get_contents($exitPath);
   if ($exitRaw !== false) {
@@ -115,7 +128,6 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
     if ($exitRaw !== "" && preg_match('/^-?\d+$/', $exitRaw)) $exitCode = (int)$exitRaw;
   }
 
-  // Read full stdout (JSON) but cap what we send back
   $stdoutFull = @file_get_contents($stdoutPath);
   if ($stdoutFull === false) $stdoutFull = "";
   $stdoutTrim = trim($stdoutFull);
@@ -136,8 +148,7 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
     $finalCombined .= "----- STDERR -----\n" . $stderrFull;
   }
 
-  // cap final output returned to browser (avoid huge responses)
-  $CAP = 220000; // ~220KB
+  $CAP = 220000;
   if (strlen($finalCombined) > $CAP) {
     $finalCombined = substr($finalCombined, -$CAP);
     $finalCombined = "(output truncated; showing last " . $CAP . " bytes)\n\n" . $finalCombined;
@@ -145,11 +156,17 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
 
   $doneOk = ($exitCode === 0) && is_array($scriptJson) && (($scriptJson["ok"] ?? null) === true);
 
+  $metaRaw = @file_get_contents($metaPath);
+  $meta = json_decode($metaRaw ?: "{}", true);
+  if (!is_array($meta)) $meta = [];
+
   json_ok([
     "running" => false,
     "exit_code" => $exitCode,
     "done_ok" => $doneOk,
-    "tail" => $tail,
+    "append" => $append,
+    "stderr_off" => $stderrNew,
+    "stdout_off" => $stdoutNew,
     "final_output" => $finalCombined,
     "script_json" => $scriptJson,
     "runner" => [
@@ -158,7 +175,7 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && isset($_GET["status"])) {
       "model" => $meta["model"] ?? null,
       "db" => $meta["db"] ?? null,
       "debug" => $meta["debug"] ?? null,
-      "use_existing_manual" => $meta["use_existing_manual"] ?? null,
+      "allow_sql" => $meta["allow_sql"] ?? null,
       "question" => $meta["question"] ?? null,
       "max_attempts" => $meta["max_attempts"] ?? null,
     ],
@@ -189,8 +206,8 @@ $out = safeRelOut((string)($in["out"] ?? "MANUAL.md"));
 
 $debug = asBool01($in["debug"] ?? 0);
 $db = asBool01($in["db"] ?? 0);
+$allowSql = asBool01($in["allow_sql"] ?? 0);
 
-$useExisting = asBool01($in["use_existing_manual"] ?? 1);
 $question = trim((string)($in["question"] ?? ""));
 if ($question !== "") {
   if (mb_strlen($question) > 2000) $question = mb_substr($question, 0, 2000);
@@ -203,11 +220,7 @@ $timeout     = clampInt(asInt($in["timeout"] ?? 240, 240), 5, 1800);
 $maxAttempts = clampInt(asInt($in["max_attempts"] ?? 3, 3), 1, 50);
 
 $startAsync = asBool01($in["start_async"] ?? 0);
-if ($startAsync !== 1) {
-  // Keep behavior strict: this endpoint is now async-only from the admin UI.
-  // If you want sync again, you can re-add it, but async is needed for live output.
-  json_err("start_async_required", 400);
-}
+if ($startAsync !== 1) json_err("start_async_required", 400);
 
 $cmdParts = [
   "php",
@@ -224,10 +237,9 @@ $cmdParts = [
 
 if ($debug) $cmdParts[] = "--debug=1";
 if ($db) $cmdParts[] = "--db=1";
+if ($allowSql) $cmdParts[] = "--allow-sql=1";
 
-if ($useExisting) $cmdParts[] = "--use-existing-manual=1";
-
-// For chat questions, always use existing manual and append
+// For chat questions: always use existing manual and append Q&A
 if ($question !== "") {
   $cmdParts[] = "--use-existing-manual=1";
   $cmdParts[] = "--question=" . $question;
@@ -244,7 +256,6 @@ $metaPath   = $dir . "/meta.json";
 
 $cmdStr = implode(" ", array_map("escapeshellarg", $cmdParts));
 
-// Run in background, write stdout/stderr/exit code into files.
 $inner = "cd " . escapeshellarg($ROOT) .
   " && " . $cmdStr .
   " > " . escapeshellarg($stdoutPath) .
@@ -264,7 +275,7 @@ $meta = [
   "model" => $model,
   "db" => (bool)$db,
   "debug" => (bool)$debug,
-  "use_existing_manual" => (bool)$useExisting,
+  "allow_sql" => (bool)$allowSql,
   "question" => ($question !== "" ? $question : null),
   "chunk_tokens" => $chunkTokens,
   "max_rounds" => $maxRounds,

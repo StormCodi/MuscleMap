@@ -1,7 +1,12 @@
 <?php
 /**
  * grok_manual_dump.php
- * (same header as your current version)
+ *
+ * Crawl project source files, send them to xAI (Grok), and generate a developer manual.
+ * - Supports: generate manual, print existing, one-shot Q&A append.
+ * - Optional DB dump via api/db.php
+ * - Optional AI-proposed SELECT queries (admin-gated via --allow-sql=1) to enrich context
+ * - Debug logs token usage (prompt/completion/total) per round and totals.
  */
 declare(strict_types=1);
 
@@ -40,6 +45,11 @@ $DB_CELL_MAX   = max(50, (int)($args['db-cell-max'] ?? 500));
 $DB_TABLES_RAW = trim((string)($args['db-tables'] ?? ""));
 $DB_ALLOWLIST  = $DB_TABLES_RAW !== "" ? array_values(array_filter(array_map('trim', explode(',', $DB_TABLES_RAW)))) : [];
 
+$ALLOW_SQL = ((string)($args['allow-sql'] ?? "0") === "1");
+$SQL_MAX_QUERIES = clampInt(asInt($args['sql-max-queries'] ?? 6, 6), 0, 25);
+$SQL_MAX_ROWS = clampInt(asInt($args['sql-max-rows'] ?? 50, 50), 1, 200);
+$SQL_MAX_BYTES = clampInt(asInt($args['sql-max-bytes'] ?? 250000, 250000), 1000, 2_000_000);
+
 if (!is_dir($ROOT)) {
   emitError("root dir not found: {$ROOT}", 1, $JSON_MODE);
 }
@@ -67,16 +77,6 @@ $excludeDirs = [
 ];
 
 $excludeFiles = [".env",".env.local",".env.production"];
-
-class SafeRecursiveDirectoryIterator extends RecursiveDirectoryIterator {
-  public function hasChildren($allow_links = false): bool {
-    try { return parent::hasChildren($allow_links); } catch (Throwable $e) { return false; }
-  }
-  public function getChildren(): RecursiveDirectoryIterator {
-    try { return parent::getChildren(); }
-    catch (Throwable $e) { return new RecursiveDirectoryIterator(__DIR__, FilesystemIterator::SKIP_DOTS); }
-  }
-}
 
 $files = collectFiles($ROOT, $allowedExt, $excludeDirs, $excludeFiles, $MAX_FILES, $MAX_TOTAL_BYTES, $DEBUG);
 
@@ -114,10 +114,22 @@ foreach ($docs as $d) {
 }
 
 $dbDumpText = "";
+$pdoForSql = null;
+if ($DB_ENABLE || $ALLOW_SQL) {
+  // We may need PDO for DB dump and/or AI SELECT enrichment
+  try {
+    $pdoForSql = getAppPdoFromApiDb($ROOT);
+  } catch (Throwable $e) {
+    $pdoForSql = null;
+    fwrite(STDERR, "WARNING: Could not obtain PDO via api/db.php: " . $e->getMessage() . "\n");
+  }
+}
+
 if ($DB_ENABLE) {
   fwrite(STDERR, "DB dump: enabled (sample={$DB_SAMPLE}, max_bytes={$DB_MAX_BYTES})\n");
   try {
-    $dbDumpText = buildDbDumpTextViaAppDb($ROOT, $DB_SAMPLE, $DB_MAX_BYTES, $DB_CELL_MAX, $DB_ALLOWLIST, $DEBUG);
+    if (!$pdoForSql) throw new RuntimeException("No PDO available");
+    $dbDumpText = buildDbDumpTextViaPdo($pdoForSql, $DB_SAMPLE, $DB_MAX_BYTES, $DB_CELL_MAX, $DB_ALLOWLIST, $DEBUG);
     if ($dbDumpText !== "") $allText .= "\n\n" . $dbDumpText . "\n\n";
   } catch (Throwable $e) {
     fwrite(STDERR, "WARNING: DB dump failed: " . $e->getMessage() . "\n");
@@ -125,15 +137,18 @@ if ($DB_ENABLE) {
   }
 }
 
+/* =========================
+   Context & paths
+========================= */
 $projectContext = <<<TXT
 You are generating a developer manual for this project.
 
 Goals:
 - Explain what each major file/module does (PHP endpoints, JS modules, pages).
-- Explain data model: sessions/messages/images, exercises, logs, muscle state, etc (only if present in code / DB dump).
+- Explain data model (only what appears in code / DB dump / query results).
 - Explain request/response flow end-to-end:
   - UI -> JS -> PHP API -> DB -> AI provider -> DB -> UI
-- Explain key fields: what each DB field means, what each JSON field means (e.g., mmj schema).
+- Explain key fields: what each DB field means, what each JSON field means (e.g., mmj schema if present).
 - Explain important invariants and edge cases (permissions, uploads, validation, error codes).
 - Provide a "How to extend" section (adding an exercise, adding a muscle group, adding a new endpoint, etc).
 - Provide a short troubleshooting section (common errors and where to look).
@@ -154,17 +169,25 @@ if ($MANUAL_PATH_RAW !== "" && !isAbsPath($manualPath)) {
 }
 
 $manualMd = "";
-$shouldGenerateManual = !$USE_EXISTING_MANUAL;
 
+/* =========================
+   Mode: print existing (no QA)
+========================= */
 if ($USE_EXISTING_MANUAL && !$QA_MODE && $ONE_QUESTION === "") {
   $existing = safeReadFile($manualPath);
   if ($existing === null) emitError("--use-existing-manual=1 but manual not found/readable: {$manualPath}", 1, $JSON_MODE);
 
   if ($JSON_MODE) {
     echo json_encode([
-      "ok" => true, "mode" => "existing",
-      "manual_path" => $manualPath, "out_path" => $absOut,
-      "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+      "ok" => true,
+      "mode" => "existing",
+      "manual_path" => $manualPath,
+      "out_path" => $absOut,
+      "model" => $model,
+      "db" => $DB_ENABLE,
+      "allow_sql" => $ALLOW_SQL,
+      "debug" => $DEBUG,
+      "usage" => ["prompt_tokens" => 0, "completion_tokens" => 0, "total_tokens" => 0],
       "output" => rtrim($existing) . "\n",
     ], JSON_UNESCAPED_SLASHES);
     exit(0);
@@ -174,6 +197,12 @@ if ($USE_EXISTING_MANUAL && !$QA_MODE && $ONE_QUESTION === "") {
   exit(0);
 }
 
+/* =========================
+   Generate manual (default) unless we are only doing Q&A append
+========================= */
+$shouldGenerateManual = !$USE_EXISTING_MANUAL && ($ONE_QUESTION === "" && !$QA_MODE);
+$usageTotals = ["prompt_tokens" => 0, "completion_tokens" => 0, "total_tokens" => 0];
+
 if ($shouldGenerateManual) {
   $attempts = 0;
   $maxAttempts = $MAX_ATTEMPTS;
@@ -181,45 +210,96 @@ if ($shouldGenerateManual) {
   $retryNudge = "";
 
   fwrite(STDERR, "Manual generation: max_attempts={$maxAttempts}\n");
+  if ($ALLOW_SQL) fwrite(STDERR, "AI SQL enrichment: enabled (max_queries={$SQL_MAX_QUERIES}, max_rows={$SQL_MAX_ROWS})\n");
 
   while (true) {
     $attempts++;
 
+    // Phase 0: ask model to propose (optional) SELECT queries for more context
+    $sqlBlock = "";
+    if ($ALLOW_SQL && $pdoForSql instanceof PDO && $SQL_MAX_QUERIES > 0) {
+      try {
+        $sqlSuggestPrompt = buildSqlSuggestPrompt($projectContext, $allText, $SQL_MAX_QUERIES, $SQL_MAX_ROWS);
+        $messages = [
+          ["role" => "system", "content" => "You are a senior engineer. If you need more DB context, propose safe SELECT queries. Output ONLY JSON."],
+          ["role" => "user", "content" => $sqlSuggestPrompt],
+        ];
+
+        fwrite(STDERR, "Attempt {$attempts}: SQL propose phase (model={$model})\n");
+        $res = xaiChat($XAI_KEY, $model, $messages, 0.2, (int)min(2500, $CHUNK_TOKENS), $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
+        addUsage($usageTotals, $res["usage"]);
+        $proposed = parseSqlProposalJson($res["text"]);
+
+        if ($proposed && !empty($proposed["queries"]) && is_array($proposed["queries"])) {
+          $executed = executeSqlEnrichment($pdoForSql, $proposed["queries"], $SQL_MAX_QUERIES, $SQL_MAX_ROWS, $SQL_MAX_BYTES, $DEBUG);
+          if ($executed !== "") {
+            $sqlBlock = "\n\n===== AI SQL ENRICHMENT (SELECT-only; admin enabled) =====\n" . $executed . "\n";
+            fwrite(STDERR, "SQL enrichment: appended\n");
+          } else {
+            fwrite(STDERR, "SQL enrichment: no queries executed/returned\n");
+          }
+        } else {
+          fwrite(STDERR, "SQL enrichment: model proposed none\n");
+        }
+      } catch (Throwable $e) {
+        fwrite(STDERR, "WARNING: SQL enrichment failed: " . $e->getMessage() . "\n");
+      }
+    }
+
+    // Build base prompt with optional enrichment results
     $userPrompt = <<<PROMPT
 {$projectContext}
 {$retryNudge}
 
-Analyze ONLY these files (and DB dump if present) and generate MANUAL.md.
+Analyze ONLY these files (and DB dump / SQL enrichment if present) and generate MANUAL.md.
 
 Requirements for MANUAL.md:
 - Title + short overview
 - High-level architecture diagram (ASCII is fine)
 - Sections:
   1) Directory/Module Map
-  2) Data Model (tables + key fields) (only what appears in files / DB dump)
+  2) Data Model (tables + key fields) (only what appears in files / DB dump / SQL enrichment)
   3) API Endpoints (path, method, request JSON, response JSON, errors)
   4) Frontend Flow (pages, JS modules, how calls happen)
-  5) AI Intake / MMJ schema explanation (if present)
-  6) How to Extend (new exercise, new endpoint, new muscle group)
+  5) AI Intake / schema explanation (if present)
+  6) How to Extend
   7) Troubleshooting (common errors, logs, permissions, DB)
   8) Q&A (empty starter section with a short note: questions/answers appended over time)
 
 IMPORTANT:
 - The manual is NOT acceptable unless it includes section "8) Q&A" (or "## Q&A") at the end.
 
-FILES:
+FILES (and DB dump if enabled):
 {$allText}
 PROMPT;
 
+    if ($sqlBlock !== "") {
+      $userPrompt .= "\n\n" . $sqlBlock . "\n";
+    }
+
+    // Phase 1: "reasoning propagation" = structured plan/outline (NOT chain-of-thought; just a build plan)
+    $planMessages = [
+      ["role" => "system", "content" => "You are a senior engineer writing internal docs. Output a concise build plan/outline for the manual."],
+      ["role" => "user", "content" => $userPrompt . "\n\nFirst: produce a structured outline for the manual (bullets). Include key files/endpoints to cover. Keep it under ~250 lines."],
+    ];
+
+    fwrite(STDERR, "Attempt {$attempts}/{$maxAttempts}: plan phase (model={$model})\n");
+    $planRes = xaiChat($XAI_KEY, $model, $planMessages, 0.2, (int)min($CHUNK_TOKENS, 6000), $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
+    addUsage($usageTotals, $planRes["usage"]);
+
+    // Phase 2: final manual generation using plan as context
     $messages = [
       ["role" => "system", "content" => "You are a senior engineer writing internal docs. Produce a complete markdown manual. No extra commentary."],
       ["role" => "user", "content" => $userPrompt],
+      ["role" => "assistant", "content" => $planRes["text"]],
+      ["role" => "user", "content" => "Now generate the FULL MANUAL.md in markdown. Follow the required 1) through 8) sections. Do not include any extra commentary outside the manual."],
     ];
 
-    fwrite(STDERR, "Attempt {$attempts}/{$maxAttempts}: calling xAI model={$model} max_tokens={$CHUNK_TOKENS}\n");
+    fwrite(STDERR, "Attempt {$attempts}/{$maxAttempts}: manual phase (model={$model} max_tokens={$CHUNK_TOKENS})\n");
+    $mdRes = xaiChat($XAI_KEY, $model, $messages, 0.2, $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
+    addUsage($usageTotals, $mdRes["usage"]);
 
-    $md = xaiChat($XAI_KEY, $model, $messages, 0.2, $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
-    $md = trim($md) . "\n";
+    $md = trim($mdRes["text"]) . "\n";
     $lastMd = $md;
 
     if (manualLooksComplete($md)) {
@@ -245,43 +325,62 @@ PROMPT;
 
   if ($JSON_MODE) {
     echo json_encode([
-      "ok" => true, "mode" => "generated",
-      "manual_path" => $manualPath, "out_path" => $absOut,
-      "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+      "ok" => true,
+      "mode" => "generated",
+      "manual_path" => $manualPath,
+      "out_path" => $absOut,
+      "model" => $model,
+      "db" => $DB_ENABLE,
+      "allow_sql" => $ALLOW_SQL,
+      "debug" => $DEBUG,
+      "usage" => $usageTotals,
       "output" => $manualMd,
     ], JSON_UNESCAPED_SLASHES);
     exit(0);
   }
 
   echo $manualMd;
-} else {
-  $existing = safeReadFile($manualPath);
-  if ($existing === null) emitError("--use-existing-manual=1 but manual not found/readable: {$manualPath}", 1, $JSON_MODE);
-  $manualMd = rtrim($existing) . "\n";
+  exit(0);
 }
 
+/* =========================
+   Q&A append (one-shot or interactive)
+========================= */
+$existing = safeReadFile($manualPath);
+if ($existing === null) {
+  // If manual doesn't exist and you're trying Q&A, that's a real problem.
+  emitError("manual not found/readable for Q&A: {$manualPath}", 1, $JSON_MODE);
+}
+$manualMd = rtrim($existing) . "\n";
+
 if ($ONE_QUESTION !== "" || $QA_MODE) {
-  $currentManual = safeReadFile($manualPath) ?? $manualMd;
+  $currentManual = $manualMd;
 
   if ($ONE_QUESTION !== "") {
     fwrite(STDERR, "Q&A one-shot: answering question (len=" . mb_strlen($ONE_QUESTION) . ")\n");
 
-    $updated = answerAndAppendQA(
+    $qaRes = answerAndAppendQA(
       $XAI_KEY, $model, $projectContext, $allText, $currentManual, $ONE_QUESTION,
-      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS
+      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS, $usageTotals
     );
 
-    if (@file_put_contents($manualPath, $updated) === false) {
+    if (@file_put_contents($manualPath, $qaRes["manual"]) === false) {
       emitError("failed to write updated manual with Q&A to {$manualPath}", 1, $JSON_MODE);
     }
 
-    $lastBlock = extractLastQaBlock($updated);
+    $lastBlock = extractLastQaBlock($qaRes["manual"]);
 
     if ($JSON_MODE) {
       echo json_encode([
-        "ok" => true, "mode" => "qa_one_shot",
-        "manual_path" => $manualPath, "out_path" => $absOut,
-        "model" => $model, "db" => $DB_ENABLE, "debug" => $DEBUG,
+        "ok" => true,
+        "mode" => "qa_one_shot",
+        "manual_path" => $manualPath,
+        "out_path" => $absOut,
+        "model" => $model,
+        "db" => $DB_ENABLE,
+        "allow_sql" => $ALLOW_SQL,
+        "debug" => $DEBUG,
+        "usage" => $usageTotals,
         "question" => $ONE_QUESTION,
         "output" => $lastBlock,
       ], JSON_UNESCAPED_SLASHES);
@@ -292,7 +391,6 @@ if ($ONE_QUESTION !== "" || $QA_MODE) {
     exit(0);
   }
 
-  // interactive mode only when not json
   if ($JSON_MODE) {
     emitError("json_mode does not support interactive qa loop; use --question", 1, $JSON_MODE);
   }
@@ -312,18 +410,18 @@ if ($ONE_QUESTION !== "" || $QA_MODE) {
 
     $currentManual = safeReadFile($manualPath) ?? $currentManual;
 
-    $updated = answerAndAppendQA(
+    $qaRes = answerAndAppendQA(
       $XAI_KEY, $model, $projectContext, $allText, $currentManual, $q,
-      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS
+      $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS, $usageTotals
     );
 
-    if (@file_put_contents($manualPath, $updated) === false) {
+    if (@file_put_contents($manualPath, $qaRes["manual"]) === false) {
       fwrite(STDERR, "ERROR: failed to write updated manual with Q&A to {$manualPath}\n");
       break;
     }
 
-    $currentManual = $updated;
-    echo "\n" . extractLastQaBlock($updated) . "\n";
+    $currentManual = $qaRes["manual"];
+    echo "\n" . extractLastQaBlock($currentManual) . "\n";
   }
 }
 
@@ -380,6 +478,13 @@ function clampInt(int $v, int $min, int $max): int {
   if ($v < $min) return $min;
   if ($v > $max) return $max;
   return $v;
+}
+
+function addUsage(array &$totals, array $u): void {
+  foreach (["prompt_tokens","completion_tokens","total_tokens"] as $k) {
+    if (!isset($totals[$k])) $totals[$k] = 0;
+    $totals[$k] += (int)($u[$k] ?? 0);
+  }
 }
 
 function pathRel(string $abs, string $root): string {
@@ -486,19 +591,37 @@ function safeReadFile(string $abs): ?string {
 }
 
 /* =========================
-   DB dump via api/db.php
+   DB dump via PDO (api/db.php)
 ========================= */
 
-function buildDbDumpTextViaAppDb(
-  string $root,
+function getAppPdoFromApiDb(string $root): PDO {
+  $path = rtrim($root, "/") . "/api/db.php";
+  if (!is_readable($path)) throw new RuntimeException("Cannot read api/db.php at: {$path}");
+
+  require_once $path;
+
+  if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) return $GLOBALS['pdo'];
+
+  if (function_exists('db')) {
+    $pdo = db();
+    if ($pdo instanceof PDO) return $pdo;
+  }
+  if (function_exists('get_pdo')) {
+    $pdo = get_pdo();
+    if ($pdo instanceof PDO) return $pdo;
+  }
+
+  throw new RuntimeException("api/db.php did not expose a PDO. Expected \$GLOBALS['pdo'] or db()/get_pdo().");
+}
+
+function buildDbDumpTextViaPdo(
+  PDO $pdo,
   int $sampleRows,
   int $maxBytes,
   int $cellMax,
   array $allowlist,
   bool $debug
 ): string {
-  $pdo = getAppPdoFromApiDb($root);
-
   $tables = [];
   foreach ($pdo->query("SHOW TABLES") as $row) $tables[] = (string)array_values($row)[0];
   sort($tables);
@@ -516,7 +639,7 @@ function buildDbDumpTextViaAppDb(
     $section = "";
 
     $stmt = $pdo->query("SHOW CREATE TABLE `{$t}`");
-    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $row = $stmt ? $stmt->fetch(PDO::FETCH_ASSOC) : null;
     $createSql = "";
     if ($row) {
       foreach ($row as $k => $v) {
@@ -552,26 +675,6 @@ function buildDbDumpTextViaAppDb(
   }
 
   return $out;
-}
-
-function getAppPdoFromApiDb(string $root): PDO {
-  $path = rtrim($root, "/") . "/api/db.php";
-  if (!is_readable($path)) throw new RuntimeException("Cannot read api/db.php at: {$path}");
-
-  require_once $path;
-
-  if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) return $GLOBALS['pdo'];
-
-  if (function_exists('db')) {
-    $pdo = db();
-    if ($pdo instanceof PDO) return $pdo;
-  }
-  if (function_exists('get_pdo')) {
-    $pdo = get_pdo();
-    if ($pdo instanceof PDO) return $pdo;
-  }
-
-  throw new RuntimeException("api/db.php did not expose a PDO. Expected \$GLOBALS['pdo'] or db()/get_pdo().");
 }
 
 function renderRowsAsMarkdownTable(array $rows, int $cellMax): string {
@@ -676,8 +779,9 @@ function answerAndAppendQA(
   int $timeoutSec,
   int $connectTimeoutSec,
   bool $debug,
-  int $maxRounds
-): string {
+  int $maxRounds,
+  array &$usageTotals
+): array {
   $currentManual = ensureQaSectionExists($currentManual);
 
   $qaPrompt = <<<PROMPT
@@ -710,7 +814,7 @@ PROMPT;
     ["role" => "user", "content" => $qaPrompt],
   ];
 
-  $qaEntry = xaiChat(
+  $res = xaiChat(
     $apiKey,
     $model,
     $messages,
@@ -721,18 +825,135 @@ PROMPT;
     $debug,
     $maxRounds
   );
+  addUsage($usageTotals, $res["usage"]);
 
-  $qaEntry = trim($qaEntry);
+  $qaEntry = trim($res["text"]);
   if (!preg_match('/^###\s+Q:\s+/i', $qaEntry)) {
     $qaEntry = "### Q: " . trim($question) . "\n\n" . trim($qaEntry);
   }
 
   $updated = rtrim($currentManual) . "\n\n" . $qaEntry . "\n";
-  return rtrim($updated) . "\n";
+  return ["manual" => rtrim($updated) . "\n"];
 }
 
 /* =========================
-   xAI chat
+   AI SQL enrichment
+========================= */
+
+function buildSqlSuggestPrompt(string $projectContext, string $allFilesText, int $maxQueries, int $maxRows): string {
+  return <<<PROMPT
+{$projectContext}
+
+You may propose up to {$maxQueries} SQL queries to gather missing context. Constraints:
+- SELECT only
+- One statement per query (no semicolons)
+- Must include LIMIT <= {$maxRows} (if missing, it will be appended)
+- Prefer "SHOW TABLES" is not allowed (SELECT only) — use information already present in files/DB dump when possible
+- Only propose queries that help write the manual (data model clarification, counts, sample shapes)
+- Do not touch information_schema/mysql/performance_schema/sys
+
+Output ONLY JSON:
+{
+  "queries": [
+    "SELECT ... LIMIT {$maxRows}",
+    ...
+  ]
+}
+
+Project files (authoritative):
+{$allFilesText}
+PROMPT;
+}
+
+function parseSqlProposalJson(string $s): ?array {
+  $s = trim($s);
+  if ($s === "") return null;
+
+  // If model wrapped in code fences, strip
+  $s = preg_replace('/^```(?:json)?\s*/i', '', $s) ?? $s;
+  $s = preg_replace('/\s*```$/', '', $s) ?? $s;
+
+  $j = json_decode($s, true);
+  return is_array($j) ? $j : null;
+}
+
+function executeSqlEnrichment(PDO $pdo, array $queries, int $maxQueries, int $maxRows, int $maxBytes, bool $debug): string {
+  $out = "";
+  $bytes = 0;
+  $n = 0;
+
+  foreach ($queries as $q) {
+    if ($n >= $maxQueries) break;
+    if (!is_string($q)) continue;
+
+    $sql = sanitizeSelectSql($q, $maxRows);
+    if ($sql === "") continue;
+
+    $n++;
+    if ($debug) fwrite(STDERR, "SQL enrichment exec #{$n}: {$sql}\n");
+
+    try {
+      $stmt = $pdo->query($sql);
+      $rows = $stmt ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
+      $block = "----- SQL: {$sql} -----\n";
+      $block .= "rows=" . count($rows) . "\n";
+      $block .= renderRowsAsMarkdownTable($rows, 300) . "\n\n";
+
+      if ($bytes + strlen($block) > $maxBytes) {
+        $out .= "----- SQL: TRUNCATED -----\nReached sql-max-bytes cap.\n";
+        break;
+      }
+
+      $out .= $block;
+      $bytes = strlen($out);
+    } catch (Throwable $e) {
+      $block = "----- SQL: {$sql} -----\n";
+      $block .= "ERROR: " . $e->getMessage() . "\n\n";
+      if ($bytes + strlen($block) > $maxBytes) break;
+      $out .= $block;
+      $bytes = strlen($out);
+    }
+  }
+
+  return trim($out);
+}
+
+function sanitizeSelectSql(string $sql, int $maxRows): string {
+  $sql = trim($sql);
+  if ($sql === "") return "";
+
+  // no semicolons (multi-statement)
+  if (strpos($sql, ";") !== false) return "";
+
+  // must be SELECT
+  if (!preg_match('/^\s*SELECT\b/is', $sql)) return "";
+
+  $low = strtolower($sql);
+  $bad = [
+    "into outfile", "into dumpfile", "load_file", "benchmark(", "sleep(",
+    "information_schema.", "mysql.", "performance_schema.", "sys.",
+  ];
+  foreach ($bad as $b) {
+    if (strpos($low, $b) !== false) return "";
+  }
+
+  // enforce LIMIT
+  if (!preg_match('/\bLIMIT\s+\d+/i', $sql)) {
+    $sql .= " LIMIT " . (string)$maxRows;
+  } else {
+    if (preg_match('/\bLIMIT\s+(\d+)/i', $sql, $m)) {
+      $n = (int)$m[1];
+      if ($n > $maxRows) {
+        $sql = preg_replace('/\bLIMIT\s+\d+/i', "LIMIT " . (string)$maxRows, $sql, 1) ?? $sql;
+      }
+    }
+  }
+
+  return $sql;
+}
+
+/* =========================
+   xAI chat (returns text + usage totals)
 ========================= */
 
 function xaiChat(
@@ -745,9 +966,11 @@ function xaiChat(
   int $connectTimeoutSec = 15,
   bool $debug = false,
   int $maxRounds = 20
-): string {
+): array {
   $full = "";
   $round = 0;
+
+  $usageTotals = ["prompt_tokens" => 0, "completion_tokens" => 0, "total_tokens" => 0];
 
   while (true) {
     $round++;
@@ -802,7 +1025,22 @@ function xaiChat(
     $content = (string)($choice["message"]["content"] ?? "");
     $finish  = (string)($choice["finish_reason"] ?? "unknown");
 
-    if ($debug) fwrite(STDERR, "Round {$round}: finish_reason={$finish}, bytes=" . strlen($content) . "\n");
+    $u = $res["usage"] ?? null;
+    if (is_array($u)) {
+      $usageTotals["prompt_tokens"] += (int)($u["prompt_tokens"] ?? 0);
+      $usageTotals["completion_tokens"] += (int)($u["completion_tokens"] ?? 0);
+      $usageTotals["total_tokens"] += (int)($u["total_tokens"] ?? 0);
+    }
+
+    if ($debug) {
+      fwrite(
+        STDERR,
+        "Round {$round}: finish_reason={$finish}, bytes=" . strlen($content) .
+        ", tokens_in=" . (int)($u["prompt_tokens"] ?? 0) .
+        " tokens_out=" . (int)($u["completion_tokens"] ?? 0) .
+        " total=" . (int)($u["total_tokens"] ?? 0) . "\n"
+      );
+    }
 
     if ($content !== "") $full .= $content;
     if ($finish !== "length") break;
@@ -811,5 +1049,5 @@ function xaiChat(
     $messages[] = ["role" => "user", "content" => "Continue exactly where you left off. Do not repeat anything already written."];
   }
 
-  return trim($full) . "\n";
+  return ["text" => trim($full) . "\n", "usage" => $usageTotals];
 }

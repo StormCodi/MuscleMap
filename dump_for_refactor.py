@@ -10,11 +10,11 @@ from pathlib import Path
 # =========================
 
 FILES = [
-    "admin_manual.php",           # UI: remove checkbox, rename btn, live console/clear, poll run_id
-    "api/admin_manual_trigger.php", # Enhance status/tail for live, add run logs
-    "grok_manual_dump.php",       # SQL querying (multi-round + endpoint), reasoning phase, token logging (--debug), remove use_existing logic
-    "api/manual_sql_query.php",   # NEW: SELECT-only endpoint (admin-only)
+    "admin_manual.php",           # UI/JS: Add copy/clear btn (clear chat+console+localStorage totals), display last/cumulative tokens+cost (from trigger response), extend localStorage for totals/since_clear, poll enhancements.
+    "api/admin_manual_trigger.php", # Enhance status JSON: Parse/include `script_json.usage` (last/cumulative tokens), add model pricing map → cost USD (e.g., grok-4 $5/M input/$15/M output), pass to response.
+    "grok_manual_dump.php",        # Q&A (--question): Add `--allow-sql=1` support (like manual gen: AI proposes SELECT → exec via new endpoint → append results), capture/log usage per Q&A call, include in `script_json` (totals since script start).
     "MANUAL.md"                   # Update ##6 How to Extend + ##7 Troubleshooting for new features
+
 ]
 
 

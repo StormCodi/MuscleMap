@@ -89,6 +89,8 @@ header("Content-Type: text/html; charset=utf-8");
     .chat-input button { min-width: 110px; }
 
     .row-note { margin-top: 8px; }
+    .console-head { display:flex; justify-content: space-between; align-items:center; gap:10px; flex-wrap: wrap; }
+    .console-actions { display:flex; gap:10px; align-items:center; }
   </style>
 </head>
 <body>
@@ -138,28 +140,28 @@ header("Content-Type: text/html; charset=utf-8");
       </div>
 
       <div class="muted row-note">
-        Live output is shown while running (polling). You’ll see progress / retries / failures without waiting for completion.
+        Live output streams while running (polling). New output appends at the bottom.
       </div>
 
       <div style="height:10px;"></div>
 
       <div class="admin-actions">
         <label class="muted" style="display:flex;gap:8px;align-items:center;">
-          <input id="debug" type="checkbox" /> debug
+          <input id="debug" type="checkbox" /> debug (includes token usage)
         </label>
         <label class="muted" style="display:flex;gap:8px;align-items:center;">
           <input id="db" type="checkbox" /> db dump
         </label>
         <label class="muted" style="display:flex;gap:8px;align-items:center;">
-          <input id="use_existing" type="checkbox" checked /> use existing manual
+          <input id="allow_sql" type="checkbox" /> allow AI SELECT queries (admin)
         </label>
 
-        <button id="btn_run">Regenerate / Print</button>
-        <button id="btn_preview">Preview MANUAL.md</button>
+        <button id="btn_run">Regenerate Manual</button>
+        <button id="btn_load">Load Manual</button>
         <span id="status" class="pill ok">idle</span>
       </div>
       <div class="muted" style="margin-top:8px;">
-        For chat questions, the UI always appends Q&A to the manual (uses existing manual).
+        Chat mode always uses the existing manual and appends Q&A blocks into it.
       </div>
     </div>
 
@@ -172,18 +174,23 @@ header("Content-Type: text/html; charset=utf-8");
           <button id="chat_send">Send</button>
           <button id="chat_clear">Clear</button>
         </div>
-        <div class="muted">Replies are the exact markdown block appended under “## Q&A” (from the manual tool).</div>
+        <div class="muted">Replies are the exact markdown block appended under “## Q&A”.</div>
       </div>
     </div>
 
     <div class="admin-card">
-      <h2 style="margin: 0 0 10px 0;">Last run output</h2>
+      <div class="console-head">
+        <h2 style="margin: 0;">Run Console</h2>
+        <div class="console-actions">
+          <button id="console_clear">Clear Console</button>
+        </div>
+      </div>
       <pre id="out_pre" class="mono">(no output yet)</pre>
     </div>
 
     <div class="admin-card">
-      <h2 style="margin: 0 0 10px 0;">Manual preview</h2>
-      <pre id="manual_pre" class="mono">(click Preview MANUAL.md)</pre>
+      <h2 style="margin: 0 0 10px 0;">Manual</h2>
+      <pre id="manual_pre" class="mono">(click Load Manual)</pre>
     </div>
   </div>
 
@@ -200,7 +207,8 @@ header("Content-Type: text/html; charset=utf-8");
 
   async function fetchManual(){
     try {
-      const r = await fetch("./MANUAL.md", { cache: "no-store", credentials: "same-origin" });
+      const outName = ($("out").value || "MANUAL.md").trim() || "MANUAL.md";
+      const r = await fetch("./" + encodeURIComponent(outName), { cache: "no-store", credentials: "same-origin" });
       const t = await r.text();
       $("manual_pre").textContent = t;
       return true;
@@ -213,10 +221,10 @@ header("Content-Type: text/html; charset=utf-8");
   function buildBasePayload(){
     return {
       model: $("model").value,
-      out: $("out").value.trim() || "MANUAL.md",
+      out: ($("out").value || "MANUAL.md").trim() || "MANUAL.md",
       debug: $("debug").checked ? 1 : 0,
       db: $("db").checked ? 1 : 0,
-      use_existing_manual: $("use_existing").checked ? 1 : 0,
+      allow_sql: $("allow_sql").checked ? 1 : 0,
       chunk_tokens: Number($("chunk_tokens").value || 12000),
       max_rounds: Number($("max_rounds").value || 20),
       timeout: Number($("timeout").value || 240),
@@ -250,7 +258,16 @@ header("Content-Type: text/html; charset=utf-8");
     log.scrollTop = log.scrollHeight;
   }
 
-  function setOut(text){
+  function consoleAppend(text){
+    if (!text) return;
+    const pre = $("out_pre");
+    if (pre.textContent === "(no output yet)") pre.textContent = "";
+    pre.textContent += text;
+    if (!pre.textContent.endsWith("\n")) pre.textContent += "\n";
+    pre.scrollTop = pre.scrollHeight;
+  }
+
+  function consoleSet(text){
     const pre = $("out_pre");
     pre.textContent = text || "";
     pre.scrollTop = pre.scrollHeight;
@@ -260,29 +277,39 @@ header("Content-Type: text/html; charset=utf-8");
   chatRender(CHAT);
 
   let RUN_POLL = null;
+  let POLL_STATE = null; // { stderr_off, stdout_off }
   function stopPoll(){
     if (RUN_POLL) {
       clearInterval(RUN_POLL);
       RUN_POLL = null;
     }
+    POLL_STATE = null;
   }
 
   async function pollRun(runId, onDone){
     stopPoll();
+    POLL_STATE = { stderr_off: 0, stdout_off: 0 };
 
     async function tick(){
       try{
-        const r = await fetch("./api/admin_manual_trigger.php?status=1&run_id=" + encodeURIComponent(runId), {
-          cache: "no-store",
-          credentials: "same-origin"
-        });
+        const qs =
+          "./api/admin_manual_trigger.php?status=1&run_id=" + encodeURIComponent(runId) +
+          "&stderr_off=" + encodeURIComponent(String(POLL_STATE.stderr_off || 0)) +
+          "&stdout_off=" + encodeURIComponent(String(POLL_STATE.stdout_off || 0));
+
+        const r = await fetch(qs, { cache: "no-store", credentials: "same-origin" });
         const data = await r.json().catch(() => null);
         if (!data || data.ok !== true) {
           setStatus(false, "poll error");
           return;
         }
 
-        setOut(data.tail || "");
+        if (data.append && typeof data.append === "string" && data.append !== "") {
+          consoleAppend(data.append);
+        }
+
+        if (typeof data.stderr_off === "number") POLL_STATE.stderr_off = data.stderr_off;
+        if (typeof data.stdout_off === "number") POLL_STATE.stdout_off = data.stdout_off;
 
         if (data.running) {
           setStatus(true, "running...");
@@ -296,27 +323,27 @@ header("Content-Type: text/html; charset=utf-8");
         if (ok) setStatus(true, "done (exit " + data.exit_code + ")");
         else setStatus(false, "failed (exit " + data.exit_code + ")");
 
-        // show a final combined output (still capped by server)
         if (typeof data.final_output === "string" && data.final_output.trim() !== "") {
-          setOut(data.final_output);
+          // final output already combined; append a divider + tail
+          consoleAppend("\n----- FINAL OUTPUT (capped) -----\n" + data.final_output + "\n");
         }
 
         await fetchManual();
         if (typeof onDone === "function") onDone(data);
       } catch(e){
         setStatus(false, "poll exception");
-        setOut(String(e));
+        consoleAppend(String(e));
         stopPoll();
       }
     }
 
     await tick();
-    RUN_POLL = setInterval(tick, 1000);
+    RUN_POLL = setInterval(tick, 750);
   }
 
   async function startAsync(payload, onDone){
     setStatus(true, "starting...");
-    setOut("(starting...)");
+    consoleAppend("\n===== START =====\n");
 
     try{
       const r = await fetch("./api/admin_manual_trigger.php", {
@@ -328,7 +355,7 @@ header("Content-Type: text/html; charset=utf-8");
 
       const data = await r.json().catch(() => null);
       if (!data || data.ok !== true || !data.run_id) {
-        setOut(JSON.stringify(data || { ok:false, error:"bad_response" }, null, 2));
+        consoleAppend(JSON.stringify(data || { ok:false, error:"bad_response" }, null, 2));
         setStatus(false, "error");
         return;
       }
@@ -336,7 +363,7 @@ header("Content-Type: text/html; charset=utf-8");
       setStatus(true, "running...");
       await pollRun(data.run_id, onDone);
     } catch(e){
-      setOut(String(e));
+      consoleAppend(String(e));
       setStatus(false, "exception");
     }
   }
@@ -358,10 +385,9 @@ header("Content-Type: text/html; charset=utf-8");
     $("chat_text").value = "";
     $("chat_send").disabled = true;
     setStatus(true, "asking...");
-    setOut("(asking...)");
+    consoleAppend("\n===== QUESTION =====\n" + text + "\n");
 
     const payload = buildBasePayload();
-    payload.use_existing_manual = 1; // always for chat
     payload.question = text;
 
     await startAsync(payload, (doneData) => {
@@ -377,15 +403,19 @@ header("Content-Type: text/html; charset=utf-8");
       $("chat_send").disabled = false;
     });
 
-    // if startAsync errors before onDone runs:
     $("chat_send").disabled = false;
   }
 
   $("btn_run").addEventListener("click", run);
-  $("btn_preview").addEventListener("click", async () => {
+  $("btn_load").addEventListener("click", async () => {
     setStatus(true, "loading manual...");
     const ok = await fetchManual();
     setStatus(ok, ok ? "manual loaded" : "manual load failed");
+  });
+
+  $("console_clear").addEventListener("click", () => {
+    consoleSet("");
+    setStatus(true, "console cleared");
   });
 
   $("chat_send").addEventListener("click", chatSend);
