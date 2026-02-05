@@ -23,6 +23,8 @@ $MAX_ROUNDS   = (int)($args['max-rounds'] ?? 20);
 $TIMEOUT      = (int)($args['timeout'] ?? 240);
 $CONN_TIMEOUT = (int)($args['connect-timeout'] ?? 20);
 
+$MAX_ATTEMPTS = clampInt(asInt($args['max-attempts'] ?? 3, 3), 1, 50);
+
 $QA_MODE      = ((string)($args['qa'] ?? "0") === "1");
 $ONE_QUESTION = trim((string)($args['question'] ?? ""));
 
@@ -79,7 +81,8 @@ class SafeRecursiveDirectoryIterator extends RecursiveDirectoryIterator {
 $files = collectFiles($ROOT, $allowedExt, $excludeDirs, $excludeFiles, $MAX_FILES, $MAX_TOTAL_BYTES, $DEBUG);
 
 if (count($files) === 0) emitError("no files collected (check excludes/root)", 1, $JSON_MODE);
-if ($DEBUG) fwrite(STDERR, "Collected " . count($files) . " files\n");
+
+fwrite(STDERR, "Collected " . count($files) . " files\n");
 
 $totalBytes = 0;
 $docs = [];
@@ -102,7 +105,8 @@ foreach ($files as $f) {
   $totalBytes += $bytes;
   if ($totalBytes >= $MAX_TOTAL_BYTES) break;
 }
-if ($DEBUG) fwrite(STDERR, "Total bytes loaded: {$totalBytes}\n");
+
+fwrite(STDERR, "Total bytes loaded: {$totalBytes}\n");
 
 $allText = "";
 foreach ($docs as $d) {
@@ -111,6 +115,7 @@ foreach ($docs as $d) {
 
 $dbDumpText = "";
 if ($DB_ENABLE) {
+  fwrite(STDERR, "DB dump: enabled (sample={$DB_SAMPLE}, max_bytes={$DB_MAX_BYTES})\n");
   try {
     $dbDumpText = buildDbDumpTextViaAppDb($ROOT, $DB_SAMPLE, $DB_MAX_BYTES, $DB_CELL_MAX, $DB_ALLOWLIST, $DEBUG);
     if ($dbDumpText !== "") $allText .= "\n\n" . $dbDumpText . "\n\n";
@@ -171,9 +176,11 @@ if ($USE_EXISTING_MANUAL && !$QA_MODE && $ONE_QUESTION === "") {
 
 if ($shouldGenerateManual) {
   $attempts = 0;
-  $maxAttempts = 3;
+  $maxAttempts = $MAX_ATTEMPTS;
   $lastMd = "";
   $retryNudge = "";
+
+  fwrite(STDERR, "Manual generation: max_attempts={$maxAttempts}\n");
 
   while (true) {
     $attempts++;
@@ -209,22 +216,22 @@ PROMPT;
       ["role" => "user", "content" => $userPrompt],
     ];
 
-    if ($DEBUG) fwrite(STDERR, "Manual generation attempt {$attempts}/{$maxAttempts}\n");
+    fwrite(STDERR, "Attempt {$attempts}/{$maxAttempts}: calling xAI model={$model} max_tokens={$CHUNK_TOKENS}\n");
 
     $md = xaiChat($XAI_KEY, $model, $messages, 0.2, $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS);
     $md = trim($md) . "\n";
     $lastMd = $md;
 
     if (manualLooksComplete($md)) {
-      if ($DEBUG) fwrite(STDERR, "Manual looks complete (passed checks).\n");
+      fwrite(STDERR, "Attempt {$attempts}: manual looks complete (passed checks)\n");
       $manualMd = $md;
       break;
     }
 
-    if ($DEBUG) fwrite(STDERR, "Manual incomplete (failed checks). Restarting from scratch.\n");
+    fwrite(STDERR, "Attempt {$attempts}: manual incomplete (failed checks)\n");
 
     if ($attempts >= $maxAttempts) {
-      fwrite(STDERR, "WARNING: manual incomplete after {$maxAttempts} attempts; writing last result anyway.\n");
+      fwrite(STDERR, "WARNING: manual incomplete after {$maxAttempts} attempts; writing last result anyway\n");
       $manualMd = $lastMd;
       break;
     }
@@ -257,6 +264,8 @@ if ($ONE_QUESTION !== "" || $QA_MODE) {
   $currentManual = safeReadFile($manualPath) ?? $manualMd;
 
   if ($ONE_QUESTION !== "") {
+    fwrite(STDERR, "Q&A one-shot: answering question (len=" . mb_strlen($ONE_QUESTION) . ")\n");
+
     $updated = answerAndAppendQA(
       $XAI_KEY, $model, $projectContext, $allText, $currentManual, $ONE_QUESTION,
       $CHUNK_TOKENS, $TIMEOUT, $CONN_TIMEOUT, $DEBUG, $MAX_ROUNDS
@@ -361,6 +370,18 @@ function isAbsPath(string $p): bool {
   return (bool)preg_match('/^[A-Za-z]:\\\\/', $p);
 }
 
+function asInt($v, int $def): int {
+  if (is_int($v)) return $v;
+  if (is_string($v) && preg_match('/^-?\d+$/', $v)) return (int)$v;
+  return $def;
+}
+
+function clampInt(int $v, int $min, int $max): int {
+  if ($v < $min) return $min;
+  if ($v > $max) return $max;
+  return $v;
+}
+
 function pathRel(string $abs, string $root): string {
   $root = rtrim($root, "/") . "/";
   $absN = str_replace("\\", "/", $abs);
@@ -383,6 +404,16 @@ function shouldExcludeRel(string $rel, array $excludeDirs, array $excludeFiles):
     if (strpos($relTrim . "/", $xd . "/") === 0) return true;
   }
   return false;
+}
+
+class SafeRecursiveDirectoryIterator extends RecursiveDirectoryIterator {
+  public function hasChildren($allow_links = false): bool {
+    try { return parent::hasChildren($allow_links); } catch (Throwable $e) { return false; }
+  }
+  public function getChildren(): RecursiveDirectoryIterator {
+    try { return parent::getChildren(); }
+    catch (Throwable $e) { return new RecursiveDirectoryIterator(__DIR__, FilesystemIterator::SKIP_DOTS); }
+  }
 }
 
 function collectFiles(
@@ -527,7 +558,6 @@ function getAppPdoFromApiDb(string $root): PDO {
   $path = rtrim($root, "/") . "/api/db.php";
   if (!is_readable($path)) throw new RuntimeException("Cannot read api/db.php at: {$path}");
 
-  // IMPORTANT: include inside function -> db.php must export PDO via $GLOBALS / db()
   require_once $path;
 
   if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) return $GLOBALS['pdo'];

@@ -10,23 +10,11 @@ from pathlib import Path
 # =========================
 
 FILES = [
-    # 1. Change "copy last checked-off set across workouts" (not just last workout)
-    "api/workout/get_last_sets_for_exercise.php",
-    
-    # 2. Add "remove exercise" button (delete all sets for exercise_id)
-    "lib/workout_editor.js",
-    "api/workout/delete_sets_for_exercise.php",  # New endpoint (or extend delete_set.php)
-    
-    # 3. Hide/mark used exercises in dropdown (track active workout exercises client-side)
-    "lib/workout_ui.js",
-    "main.js",
-    
-    # 4. Propagation clarification: No change needed (per-row only); if desired, add to workout_editor.js
-    # Crucial context (read-only):
-    "lib/workout_ui.js",  # Orchestrates addExerciseAsOneSet() + viewingSets
-    "main.js",            # exerciseSelect population + addExerciseAsOneSet()
-    "api/workout/add_set.php",  # Set insertion (called by ui)
-    "api/workout/_lib.php",     # workout_summary(), get_active_workout()
+    "admin_manual.php",           # UI: remove checkbox, rename btn, live console/clear, poll run_id
+    "api/admin_manual_trigger.php", # Enhance status/tail for live, add run logs
+    "grok_manual_dump.php",       # SQL querying (multi-round + endpoint), reasoning phase, token logging (--debug), remove use_existing logic
+    "api/manual_sql_query.php",   # NEW: SELECT-only endpoint (admin-only)
+    "MANUAL.md"                   # Update ##6 How to Extend + ##7 Troubleshooting for new features
 ]
 
 

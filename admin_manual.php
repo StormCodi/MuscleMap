@@ -22,7 +22,7 @@ header("Content-Type: text/html; charset=utf-8");
     .admin-wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
     .admin-card { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; margin-bottom: 14px; }
     .admin-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .admin-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .admin-row-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
     label { display:block; font-size: 12px; opacity: 0.9; margin-bottom: 4px; }
     input[type="text"], input[type="number"], select, textarea {
       width: 100%;
@@ -87,6 +87,8 @@ header("Content-Type: text/html; charset=utf-8");
     .chat-input { display:flex; gap:10px; }
     .chat-input textarea { min-height: 56px; margin:0; }
     .chat-input button { min-width: 110px; }
+
+    .row-note { margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -116,7 +118,7 @@ header("Content-Type: text/html; charset=utf-8");
 
       <div style="height:10px;"></div>
 
-      <div class="admin-row-3">
+      <div class="admin-row-4">
         <div>
           <label for="chunk_tokens">chunk-tokens</label>
           <input id="chunk_tokens" type="number" min="1000" max="50000" value="12000" />
@@ -129,6 +131,14 @@ header("Content-Type: text/html; charset=utf-8");
           <label for="timeout">timeout (sec)</label>
           <input id="timeout" type="number" min="5" max="1800" value="240" />
         </div>
+        <div>
+          <label for="max_attempts">max-attempts</label>
+          <input id="max_attempts" type="number" min="1" max="50" value="5" />
+        </div>
+      </div>
+
+      <div class="muted row-note">
+        Live output is shown while running (polling). You’ll see progress / retries / failures without waiting for completion.
       </div>
 
       <div style="height:10px;"></div>
@@ -210,6 +220,7 @@ header("Content-Type: text/html; charset=utf-8");
       chunk_tokens: Number($("chunk_tokens").value || 12000),
       max_rounds: Number($("max_rounds").value || 20),
       timeout: Number($("timeout").value || 240),
+      max_attempts: Number($("max_attempts").value || 3),
       json: 1
     };
   }
@@ -239,38 +250,101 @@ header("Content-Type: text/html; charset=utf-8");
     log.scrollTop = log.scrollHeight;
   }
 
+  function setOut(text){
+    const pre = $("out_pre");
+    pre.textContent = text || "";
+    pre.scrollTop = pre.scrollHeight;
+  }
+
   let CHAT = chatLoad();
   chatRender(CHAT);
 
-  async function run(){
-    setStatus(true, "running...");
-    $("out_pre").textContent = "(running...)";
+  let RUN_POLL = null;
+  function stopPoll(){
+    if (RUN_POLL) {
+      clearInterval(RUN_POLL);
+      RUN_POLL = null;
+    }
+  }
 
-    const payload = buildBasePayload();
-    payload.question = ""; // runner mode
+  async function pollRun(runId, onDone){
+    stopPoll();
+
+    async function tick(){
+      try{
+        const r = await fetch("./api/admin_manual_trigger.php?status=1&run_id=" + encodeURIComponent(runId), {
+          cache: "no-store",
+          credentials: "same-origin"
+        });
+        const data = await r.json().catch(() => null);
+        if (!data || data.ok !== true) {
+          setStatus(false, "poll error");
+          return;
+        }
+
+        setOut(data.tail || "");
+
+        if (data.running) {
+          setStatus(true, "running...");
+          return;
+        }
+
+        // done
+        stopPoll();
+
+        const ok = !!data.done_ok;
+        if (ok) setStatus(true, "done (exit " + data.exit_code + ")");
+        else setStatus(false, "failed (exit " + data.exit_code + ")");
+
+        // show a final combined output (still capped by server)
+        if (typeof data.final_output === "string" && data.final_output.trim() !== "") {
+          setOut(data.final_output);
+        }
+
+        await fetchManual();
+        if (typeof onDone === "function") onDone(data);
+      } catch(e){
+        setStatus(false, "poll exception");
+        setOut(String(e));
+        stopPoll();
+      }
+    }
+
+    await tick();
+    RUN_POLL = setInterval(tick, 1000);
+  }
+
+  async function startAsync(payload, onDone){
+    setStatus(true, "starting...");
+    setOut("(starting...)");
 
     try{
       const r = await fetch("./api/admin_manual_trigger.php", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
-        body: JSON.stringify(payload)
+        body: JSON.stringify(Object.assign({}, payload, { start_async: 1 }))
       });
 
       const data = await r.json().catch(() => null);
-      if (!data || data.ok !== true) {
-        $("out_pre").textContent = JSON.stringify(data || { ok:false, error:"bad_response" }, null, 2);
+      if (!data || data.ok !== true || !data.run_id) {
+        setOut(JSON.stringify(data || { ok:false, error:"bad_response" }, null, 2));
         setStatus(false, "error");
         return;
       }
 
-      $("out_pre").textContent = data.output || "(no output)";
-      setStatus(true, "done (exit " + data.exit_code + ")");
-      await fetchManual();
+      setStatus(true, "running...");
+      await pollRun(data.run_id, onDone);
     } catch(e){
-      $("out_pre").textContent = String(e);
+      setOut(String(e));
       setStatus(false, "exception");
     }
+  }
+
+  async function run(){
+    const payload = buildBasePayload();
+    payload.question = ""; // runner mode
+    await startAsync(payload, null);
   }
 
   async function chatSend(){
@@ -284,45 +358,27 @@ header("Content-Type: text/html; charset=utf-8");
     $("chat_text").value = "";
     $("chat_send").disabled = true;
     setStatus(true, "asking...");
+    setOut("(asking...)");
 
     const payload = buildBasePayload();
     payload.use_existing_manual = 1; // always for chat
     payload.question = text;
 
-    try{
-      const r = await fetch("./api/admin_manual_trigger.php", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: JSON.stringify(payload)
-      });
-
-      const data = await r.json().catch(() => null);
-      if (!data || data.ok !== true) {
-        CHAT.push({ role: "assistant", text: JSON.stringify(data || { ok:false, error:"bad_response" }, null, 2) });
-        chatSave(CHAT);
-        chatRender(CHAT);
-        setStatus(false, "error");
-        return;
+    await startAsync(payload, (doneData) => {
+      try{
+        const sj = doneData && doneData.script_json ? doneData.script_json : null;
+        const answer = (sj && sj.output) ? sj.output : "(no script_json.output)";
+        CHAT.push({ role: "assistant", text: answer });
+      } catch (e) {
+        CHAT.push({ role: "assistant", text: String(e) });
       }
-
-      const sj = data.script_json || null;
-      const answer = (sj && sj.output) ? sj.output : "(no script_json.output)";
-      CHAT.push({ role: "assistant", text: answer });
       chatSave(CHAT);
       chatRender(CHAT);
-
-      $("out_pre").textContent = data.output || "(no output)";
-      setStatus(true, "done");
-      await fetchManual();
-    } catch(e){
-      CHAT.push({ role: "assistant", text: String(e) });
-      chatSave(CHAT);
-      chatRender(CHAT);
-      setStatus(false, "exception");
-    } finally {
       $("chat_send").disabled = false;
-    }
+    });
+
+    // if startAsync errors before onDone runs:
+    $("chat_send").disabled = false;
   }
 
   $("btn_run").addEventListener("click", run);
